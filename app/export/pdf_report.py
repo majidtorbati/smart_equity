@@ -69,7 +69,7 @@ class RTLReport:
         text = str(text).replace(chr(0x200C), '')
         visual = fa(text)
 
-        pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/%+\-]*")
+        pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/%+\-()]*")
 
         runs = []
         pos = 0
