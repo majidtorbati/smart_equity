@@ -38,12 +38,11 @@ from app.config.settings import (get_company_name, get_report_prepared_by, get_r
                                   get_report_title, get_logo_path, DEVELOPER_CREDIT_LINE)
 
 ASSETS_DIR = resource_root() / "assets"
-FONT_REGULAR = str(ASSETS_DIR / "Vazirmatn-Regular.ttf")
-FONT_BOLD = str(ASSETS_DIR / "Vazirmatn-Bold.ttf")
-FONT_LATIN = FONT_REGULAR
-FONT_LATIN_BOLD = FONT_BOLD
+FONT_REGULAR = str(ASSETS_DIR / "BNazanin.ttf")
+FONT_BOLD = str(ASSETS_DIR / "BTitrBd.ttf")
+FONT_LATIN = str(ASSETS_DIR / "Vazirmatn-Regular.ttf")
+FONT_LATIN_BOLD = str(ASSETS_DIR / "Vazirmatn-Bold.ttf")
 
-# فونت واحد و استاندارد برای جلوگیری از ناسازگاری BNazanin/BTitr با حروف فارسی
 pdfmetrics.registerFont(TTFont("BNazanin", FONT_REGULAR))
 pdfmetrics.registerFont(TTFont("BTitr", FONT_BOLD))
 pdfmetrics.registerFont(TTFont("Vazirmatn", FONT_LATIN))
