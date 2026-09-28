@@ -5,6 +5,7 @@ PDF Executive Report ، گزارش حرفه‌ای هیئت‌مدیره.
 همه تاریخ‌ها شمسی نمایش داده می‌شوند (ذخیره‌سازی داخلی همچنان میلادی است).
 """
 from __future__ import annotations
+import re
 import sqlite3
 import sys
 import pathlib

@@ -57,9 +57,9 @@ def detect_large_trades(conn: sqlite3.Connection, start=None, end=None,
     mean_v = statistics.mean(values)
     stdev_v = statistics.pstdev(values) or 1.0
     person_names = {
-        r[0]: " ".join(part for part in (r[1], r[2]) if part and str(part).strip()) or "?"
+        r[0]: r[1] or "?"
         for r in conn.execute(
-            "SELECT person_id, first_name, family_name FROM persons"
+            "SELECT person_id, name_raw FROM persons"
         ).fetchall()
     }
 
@@ -102,9 +102,9 @@ def detect_price_outliers(conn, start=None, end=None, iqr_k: float = 3.0) -> lis
     for tx_id, date, price, value, qty, buyer_id, seller_id in rows:
         by_day.setdefault(date, []).append((tx_id, price, value, qty, buyer_id, seller_id))
     person_names = {
-        r[0]: " ".join(part for part in (r[1], r[2]) if part and str(part).strip()) or "?"
+        r[0]: r[1] or "?"
         for r in conn.execute(
-            "SELECT person_id, first_name, family_name FROM persons"
+            "SELECT person_id, name_raw FROM persons"
         ).fetchall()
     }
 

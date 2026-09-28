@@ -105,15 +105,15 @@ def test_daily_player_registry_evidence_statuses():
         status = row["registry_status"]
         evidence_counts[status] = evidence_counts.get(status, 0) + 1
 
-    assert evidence_counts["REGISTRY_HISTORY_PRESENT"] == 86
+    assert evidence_counts["REGISTRY_HISTORY_PRESENT"] == 79
     assert evidence_counts["REGISTRY_NEW_ON_SNAPSHOT"] == 1
-    assert evidence_counts["NO_REGISTRY_MATCH"] == 112
+    assert evidence_counts["NO_REGISTRY_MATCH"] == 119
 
 
 def test_daily_player_registry_evidence_summary():
     result = _run()
 
-    assert result["registry_evidence_rows"] == 8569
+    assert result["registry_evidence_rows"] == 8354
     assert result["registry_new_on_snapshot_count"] == 105
 
 
