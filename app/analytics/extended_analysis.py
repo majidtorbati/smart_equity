@@ -1,4 +1,4 @@
-"""
+﻿"""
 تحلیل‌های تکمیلی درخواستی هیئت‌مدیره: HHI، بنیادی، کیفی، روش‌های ارزش‌گذاری.
 
 اصل راهنما (طبق همان قانونی که در کل این پروژه رعایت شده):
@@ -29,17 +29,29 @@ from app.core.labels import concentration_level_fa
 
 
 def hhi_summary(conn: sqlite3.Connection, start=None, end=None) -> dict:
-    """بسته‌بندی HHI خریداران/فروشندگان با تفسیر متنی، برای اسلاید اختصاصی."""
     c_buy = m.concentration(conn, "buyer", start, end)
     c_sell = m.concentration(conn, "seller", start, end)
-    level_fa = {"Low concentration": "پایین", "Medium concentration": "متوسط", "High concentration": "بالا"}
+
+    level_fa = {
+        "Low concentration": "پایین",
+        "Medium concentration": "متوسط",
+        "High concentration": "بالا",
+    }
+
     narrative = [
-        f"شاخص HHI خرید {c_buy['hhi']:.0f} است (سطح تمرکز: {level_fa.get(c_buy['level'], c_buy['level'])}؛ "
-        f"مقیاس استاندارد HHI از ? تا ??,??? است).",
-        f"{c_buy['top10_share_pct']:.1f}٪ از ارزش خرید در اختیار ?? خریدار برتر است.",
-        f"شاخص HHI فروش {c_sell['hhi']:.0f} است (سطح تمرکز: {level_fa.get(c_sell['level'], c_sell['level'])}).",
+        f"شاخص HHI خرید {c_buy['hhi']:.0f} است "
+        f"(سطح تمرکز: {level_fa.get(c_buy['level'], c_buy['level'])}؛ "
+        f"مقیاس استاندارد HHI از ۰ تا ۱۰٬۰۰۰ است).",
+        f"{c_buy['top10_share_pct']:.1f}٪ از ارزش خرید در اختیار ۱۰ خریدار برتر است.",
+        f"شاخص HHI فروش {c_sell['hhi']:.0f} است "
+        f"(سطح تمرکز: {level_fa.get(c_sell['level'], c_sell['level'])}).",
     ]
-    return {"buy": c_buy, "sell": c_sell, "narrative": narrative}
+
+    return {
+        "buy": c_buy,
+        "sell": c_sell,
+        "narrative": narrative,
+    }
 
 def fundamental_analysis_note(conn: sqlite3.Connection) -> dict:
     """

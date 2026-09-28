@@ -64,29 +64,16 @@ class RTLReport:
         self._tmp_files = []
 
     def _mixed_runs(self, text, primary_font):
-        import re
-
+        """
+        ??? ????? ? ????? ?? ?? ?? bidi/reshape ?? ?? ???? ???? ??? ??????.
+        ??? ??? ?? ????? ???? BNazanin/BTitr ?? Vazirmatn ?? ?? ?? ??????? ??????.
+        """
         text = str(text).replace(chr(0x200C), '')
         visual = fa(text)
 
-        pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/%+\-]*")
+        font_name = "VazirmatnBold" if primary_font == "BTitr" else "Vazirmatn"
 
-        runs = []
-        pos = 0
-
-        for m in pattern.finditer(visual):
-            if m.start() > pos:
-                runs.append((visual[pos:m.start()], primary_font))
-            runs.append((m.group(0), "Vazirmatn"))
-            pos = m.end()
-
-        if pos < len(visual):
-            runs.append((visual[pos:], primary_font))
-
-        if not runs:
-            runs = [(visual, primary_font)]
-
-        return runs
+        return [(visual, font_name)]
 
     def _mixed_width(self, text, size, primary_font):
         return sum(
@@ -95,21 +82,17 @@ class RTLReport:
         )
 
     def _draw_mixed_right(self, text, right_x, y, size, primary_font, color=None):
-        runs = self._mixed_runs(text, primary_font)
-        total_width = sum(
-            self.c.stringWidth(part, font_name, size)
-            for part, font_name in runs
-        )
-
-        x = right_x - total_width
+        text = str(text)
+        visual = fa(text)
 
         if color is not None:
             self.c.setFillColor(color)
 
-        for part, font_name in runs:
-            self.c.setFont(font_name, size)
-            self.c.drawString(x, y, part)
-            x += self.c.stringWidth(part, font_name, size)
+        font_name = "VazirmatnBold" if primary_font == "BTitr" else "Vazirmatn"
+
+        width = self.c.stringWidth(visual, font_name, size)
+        self.c.setFont(font_name, size)
+        self.c.drawString(right_x - width, y, visual)
 
         if color is not None:
             self.c.setFillColor(colors.black)
