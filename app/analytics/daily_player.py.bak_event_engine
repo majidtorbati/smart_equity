@@ -1,0 +1,196 @@
+﻿"""
+Smart Equity — Phase 2: Daily Player Analysis
+Read-only daily player behavior engine.
+"""
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+
+def run_daily_player_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
+    """
+    Aggregate transactions by trading day, symbol and player.
+
+    This engine is read-only and does not modify the database.
+    """
+    conn.row_factory = sqlite3.Row
+
+    rows = conn.execute(
+        """
+        SELECT
+            t.trade_date_gregorian AS trade_date,
+            t.trade_date_jalali AS trade_date_jalali,
+            t.symbol_id,
+            t.buyer_person_id,
+            t.seller_person_id,
+            t.quantity,
+            t.price,
+            t.value,
+            pb.person_type AS buyer_person_type,
+            ps.person_type AS seller_person_type
+        FROM transactions t
+        LEFT JOIN persons pb ON pb.person_id = t.buyer_person_id
+        LEFT JOIN persons ps ON ps.person_id = t.seller_person_id
+        WHERE t.quantity > 0
+          AND t.price > 0
+          AND t.value > 0
+        ORDER BY t.trade_date_gregorian, t.symbol_id
+        """
+    ).fetchall()
+
+    daily: dict[tuple, dict[str, Any]] = {}
+
+    for row in rows:
+        trade_date = row["trade_date"]
+        jalali = row["trade_date_jalali"]
+        symbol_id = row["symbol_id"]
+
+        # BUY side
+        if row["buyer_person_id"] is not None:
+            key = (trade_date, symbol_id, row["buyer_person_id"])
+            item = daily.setdefault(
+                key,
+                {
+                    "trade_date": trade_date,
+                    "trade_date_jalali": jalali,
+                    "symbol_id": symbol_id,
+                    "person_id": row["buyer_person_id"],
+                    "person_type": row["buyer_person_type"],
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "buy_quantity": 0,
+                    "sell_quantity": 0,
+                    "buy_value": 0,
+                    "sell_value": 0,
+                },
+            )
+            item["buy_count"] += 1
+            item["buy_quantity"] += row["quantity"]
+            item["buy_value"] += row["value"]
+
+        # SELL side
+        if row["seller_person_id"] is not None:
+            key = (trade_date, symbol_id, row["seller_person_id"])
+            item = daily.setdefault(
+                key,
+                {
+                    "trade_date": trade_date,
+                    "trade_date_jalali": jalali,
+                    "symbol_id": symbol_id,
+                    "person_id": row["seller_person_id"],
+                    "person_type": row["seller_person_type"],
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "buy_quantity": 0,
+                    "sell_quantity": 0,
+                    "buy_value": 0,
+                    "sell_value": 0,
+                },
+            )
+            item["sell_count"] += 1
+            item["sell_quantity"] += row["quantity"]
+            item["sell_value"] += row["value"]
+
+    result = []
+
+    for item in daily.values():
+        buy_value = item["buy_value"]
+        sell_value = item["sell_value"]
+
+        buy_quantity = item["buy_quantity"]
+        sell_quantity = item["sell_quantity"]
+
+        total_value = buy_value + sell_value
+        total_quantity = buy_quantity + sell_quantity
+
+        item["avg_buy_price"] = (
+            buy_value / buy_quantity if buy_quantity else 0.0
+        )
+        item["avg_sell_price"] = (
+            sell_value / sell_quantity if sell_quantity else 0.0
+        )
+
+        item["net_quantity"] = buy_quantity - sell_quantity
+        item["net_value"] = buy_value - sell_value
+
+        item["activity_count"] = (
+            item["buy_count"] + item["sell_count"]
+        )
+
+        item["buy_sell_value_ratio"] = (
+            buy_value / sell_value if sell_value else None
+        )
+
+        item["participation_value"] = total_value
+        item["participation_quantity"] = total_quantity
+
+        result.append(item)
+
+    return {
+        "ready": True,
+        "transactions_used": len(rows),
+        "player_days": len(result),
+        "days": len({x["trade_date"] for x in result}),
+        "symbols": len({x["symbol_id"] for x in result}),
+        "players": len({x["person_id"] for x in result}),
+        "rows": result,
+    }
+
+
+def audit_daily_player(db_path: str | Path) -> dict[str, Any]:
+    """Run Phase 2 against a SQLite database in read-only mode."""
+    db_path = Path(db_path).resolve()
+
+    if not db_path.exists():
+        raise FileNotFoundError(f"Database not found: {db_path}")
+
+    uri = f"file:{db_path.as_posix()}?mode=ro"
+
+    conn = sqlite3.connect(uri, uri=True)
+
+    try:
+        return run_daily_player_analysis(conn)
+    finally:
+        conn.close()
+
+
+def main() -> int:
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(
+        description="Smart Equity Phase 2 — Daily Player Analysis"
+    )
+    parser.add_argument(
+        "db_path",
+        nargs="?",
+        default="data/smart_equity.db",
+    )
+
+    args = parser.parse_args()
+
+    result = audit_daily_player(args.db_path)
+
+    print(
+        json.dumps(
+            {
+                "ready": result["ready"],
+                "transactions_used": result["transactions_used"],
+                "player_days": result["player_days"],
+                "days": result["days"],
+                "symbols": result["symbols"],
+                "players": result["players"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

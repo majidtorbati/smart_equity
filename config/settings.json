@@ -1,0 +1,19 @@
+{
+  "company_name": "",
+  "primary_market_maker_broker_names": [
+    "بازارگردان الکترونیکی الگوریتمی صباتامین"
+  ],
+  "report_prepared_by": "مدیر مالی",
+  "report_audience": "هیئت‌مدیره",
+  "report_title": "گزارش تحلیل معاملات سهام",
+  "logo_path": "",
+  "ollama_base_url": "http://127.0.0.1:11434",
+  "ollama_model": "qwen2.5-coder:7b",
+  "local_ai_base_url": "",
+  "local_ai_model": "",
+  "local_ai_api_key": "",
+  "openai_model": "gpt-5.6-luna",
+  "openai_api_key": "",
+  "report_heading_font": "B Titr",
+  "report_body_font": "B Nazanin"
+}

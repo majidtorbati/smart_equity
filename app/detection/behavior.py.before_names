@@ -1,0 +1,247 @@
+"""
+Short-Term Trading Behavior Engine («نوسان‌گیری»)
+هیچ ادعای قطعی درباره قصد یا هویت معامله‌گر نمی‌شود.
+خروجی یک امتیاز آماری 0-100 است که فقط الگوی رفتار مشاهده‌شده را توصیف می‌کند.
+
+محدودیت مهم: چون ترتیب دقیق لحظه‌ای معاملات داخل یک روز در داده مشخص نیست (فقط تاریخ روز
+موجود است، نه ساعت دقیق)، رفتار Round-Trip در سطح "روز" تشخیص داده می‌شود، نه لحظه‌ای.
+این محدودیت باید همیشه در گزارش نمایش داده شود.
+"""
+from __future__ import annotations
+import sqlite3
+import sys
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+from app.analytics.metrics import _date_filter
+
+DISCLAIMER = ("این امتیاز یک شاخص آماری از الگوی معاملات مشاهده‌شده است و اثبات‌کننده قصد یا "
+              "استراتژی واقعی شخص نیست. تشخیص بر مبنای روز معاملاتی است، نه ساعت دقیق سفارش.")
+
+
+def _person_daily_activity(conn, person_id: int, start=None, end=None) -> list[dict]:
+    """فعالیت روزانه یک شخص در هر دو سمت خرید/فروش، برای همان نماد."""
+    where, params = _date_filter(start, end)
+    rows = conn.execute(f"""
+        SELECT trade_date_gregorian,
+               SUM(CASE WHEN buyer_person_id=? THEN quantity ELSE 0 END) as buy_qty,
+               SUM(CASE WHEN seller_person_id=? THEN quantity ELSE 0 END) as sell_qty,
+               SUM(CASE WHEN buyer_person_id=? THEN value ELSE 0 END) as buy_val,
+               SUM(CASE WHEN seller_person_id=? THEN value ELSE 0 END) as sell_val
+        FROM transactions t
+        WHERE {where} AND (buyer_person_id=? OR seller_person_id=?)
+        GROUP BY trade_date_gregorian ORDER BY trade_date_gregorian
+    """, [person_id, person_id, person_id, person_id] + params + [person_id, person_id]).fetchall()
+    return [
+        {"date": r[0], "buy_qty": r[1], "sell_qty": r[2], "buy_val": r[3], "sell_val": r[4]}
+        for r in rows
+    ]
+
+
+def detect_round_trips(conn, person_id: int, start=None, end=None) -> list[dict]:
+    """
+    الگوهای رفت‌وبرگشت روزانه: خرید در روز A و سپس فروش در روز B بعد از آن (یا برعکس)، برای همان شخص.
+    فقط "الگوی مشاهده‌شده" را برمی‌گرداند، نه FIFO دقیق واقعی.
+    """
+    daily = _person_daily_activity(conn, person_id, start, end)
+    events = []
+    for d in daily:
+        if d["buy_qty"] > 0:
+            events.append(("BUY", d["date"], d["buy_qty"], d["buy_val"]))
+        if d["sell_qty"] > 0:
+            events.append(("SELL", d["date"], d["sell_qty"], d["sell_val"]))
+    events.sort(key=lambda e: e[1])
+
+    round_trips = []
+    open_side = None
+    open_event = None
+    for side, date, qty, val in events:
+        if open_side is None:
+            open_side = side
+            open_event = (date, qty, val)
+            continue
+        if side != open_side:
+            entry_date, entry_qty, entry_val = open_event
+            entry_price = entry_val / entry_qty if entry_qty else 0
+            exit_price = val / qty if qty else 0
+            price_change_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price else 0
+            round_trips.append({
+                "entry_side": open_side,
+                "entry_date": entry_date,
+                "exit_side": side,
+                "exit_date": date,
+                "entry_price": round(entry_price, 2),
+                "exit_price": round(exit_price, 2),
+                "price_change_pct": round(price_change_pct, 2),
+            })
+            open_side = side
+            open_event = (date, qty, val)
+        else:
+            # same side continues; extend window (accumulate) — keep the latest as open position marker
+            open_event = (date, open_event[1] + qty, open_event[2] + val)
+    return round_trips
+
+
+def short_term_behavior_score(conn, person_id: int, start=None, end=None) -> dict:
+    daily = _person_daily_activity(conn, person_id, start, end)
+    n_active_days = len(daily)
+    if n_active_days == 0:
+        return {"score": 0, "level": "بدون فعالیت", "disclaimer": DISCLAIMER, "components": {}}
+
+    round_trips = detect_round_trips(conn, person_id, start, end)
+    n_round_trips = len(round_trips)
+
+    both_side_days = sum(1 for d in daily if d["buy_qty"] > 0 and d["sell_qty"] > 0)
+    total_buy = sum(d["buy_qty"] for d in daily)
+    total_sell = sum(d["sell_qty"] for d in daily)
+    total_qty = total_buy + total_sell
+    turnover_ratio = (min(total_buy, total_sell) / (total_qty / 2)) if total_qty else 0  # 0..1, 1=perfectly balanced buy/sell
+
+    # component scores (0-1 each), then weighted combine -> 0-100
+    freq_component = min(1.0, n_active_days / 15)                     # frequent activity across many days
+    roundtrip_component = min(1.0, n_round_trips / 5)                 # multiple buy<->sell reversals
+    same_day_component = min(1.0, both_side_days / max(1, n_active_days))  # buys & sells same day
+    turnover_component = turnover_ratio                                # balanced buy/sell volume = flip-like
+
+    weights = {"freq": 0.20, "roundtrip": 0.35, "same_day": 0.25, "turnover": 0.20}
+    raw = (freq_component * weights["freq"] + roundtrip_component * weights["roundtrip"]
+           + same_day_component * weights["same_day"] + turnover_component * weights["turnover"])
+    score = round(raw * 100, 1)
+
+    if score < 20:
+        level = "فعالیت کم"
+    elif score < 40:
+        level = "رفتار معاملاتی کم"
+    elif score < 60:
+        level = "رفتار معاملاتی متوسط"
+    elif score < 80:
+        level = "رفتار معاملاتی کوتاه‌مدت بالا"
+    else:
+        level = "الگوی بسیار بالای معاملات کوتاه‌مدت"
+
+    return {
+        "score": score,
+        "level": level,
+        "disclaimer": DISCLAIMER,
+        "components": {
+            "active_days": n_active_days,
+            "n_round_trips": n_round_trips,
+            "both_side_days": both_side_days,
+            "turnover_ratio": round(turnover_ratio, 3),
+            "total_buy_qty": total_buy,
+            "total_sell_qty": total_sell,
+        },
+        "round_trips": round_trips,
+    }
+
+
+def same_day_buy_sell_pairs(conn, start=None, end=None, top_n: int = 100, min_overlap_qty: int = 1) -> list[dict]:
+    """
+    برای هر شخص و هر روزی که هم خرید و هم فروش همان نماد را داشته، یک ردیف مقایسه‌ای می‌سازد:
+    تعداد/نرخ خرید در برابر تعداد/نرخ فروش همان روز.
+
+    این دقیق‌ترین تعریف «نوسان‌گیری» است که با داده‌ی روزانه (بدون ساعت دقیق سفارش) قابل اثبات است:
+    شخصی که در یک روز مشخص، هم در سمت خرید و هم در سمت فروش همان نماد دیده شده.
+
+    محدودیت صادقانه: چون نمی‌دانیم دقیقاً کدام سهمِ خریداری‌شده فروخته شده (FIFO/LIFO واقعی نامعلوم است)،
+    «سود/زیان تقریبی» فقط بر مبنای اختلاف میانگین نرخ خرید و فروش همان روز محاسبه می‌شود، نه تطبیق دقیق لات.
+    """
+    where, params = _date_filter(start, end)
+    rows = conn.execute(f"""
+        WITH buy_agg AS (
+            SELECT buyer_person_id AS person_id, trade_date_gregorian AS date,
+                   SUM(quantity) AS buy_qty, SUM(value) AS buy_value, COUNT(*) AS n_buy_tx
+            FROM transactions t WHERE {where}
+            GROUP BY buyer_person_id, trade_date_gregorian
+        ),
+        sell_agg AS (
+            SELECT seller_person_id AS person_id, trade_date_gregorian AS date,
+                   SUM(quantity) AS sell_qty, SUM(value) AS sell_value, COUNT(*) AS n_sell_tx
+            FROM transactions t WHERE {where}
+            GROUP BY seller_person_id, trade_date_gregorian
+        )
+        SELECT b.person_id, b.date, b.buy_qty, b.buy_value, b.n_buy_tx,
+               s.sell_qty, s.sell_value, s.n_sell_tx
+        FROM buy_agg b JOIN sell_agg s ON b.person_id = s.person_id AND b.date = s.date
+    """, params + params).fetchall()
+
+    names = dict(conn.execute("SELECT person_id, name_raw FROM persons"))
+    results = []
+    for person_id, date, buy_qty, buy_value, n_buy_tx, sell_qty, sell_value, n_sell_tx in rows:
+        overlap_qty = min(buy_qty, sell_qty)
+        if overlap_qty < min_overlap_qty:
+            continue
+        buy_price = buy_value / buy_qty if buy_qty else 0
+        sell_price = sell_value / sell_qty if sell_qty else 0
+        overlap_ratio = overlap_qty / max(buy_qty, sell_qty) if max(buy_qty, sell_qty) else 0
+        price_diff_pct = ((sell_price - buy_price) / buy_price * 100) if buy_price else 0
+        approx_pnl = (sell_price - buy_price) * overlap_qty
+
+        if overlap_ratio >= 0.8:
+            verdict = "نوسان‌گیری کامل (هم‌پوشانی بالا)"
+        elif overlap_ratio >= 0.3:
+            verdict = "نوسان‌گیری محتمل (هم‌پوشانی جزئی)"
+        else:
+            verdict = "هم‌پوشانی کم (ممکن است جابه‌جایی جزئی پرتفوی باشد)"
+
+        results.append({
+            "person_id": person_id, "name": names.get(person_id), "date": date,
+            "buy_qty": buy_qty, "buy_price": round(buy_price, 1), "n_buy_tx": n_buy_tx,
+            "sell_qty": sell_qty, "sell_price": round(sell_price, 1), "n_sell_tx": n_sell_tx,
+            "overlap_qty": overlap_qty, "overlap_ratio": round(overlap_ratio, 3),
+            "price_diff_pct": round(price_diff_pct, 2), "approx_pnl": round(approx_pnl, 0),
+            "verdict": verdict,
+        })
+    return sorted(results, key=lambda r: r["overlap_qty"] * max(r["buy_price"], r["sell_price"]), reverse=True)[:top_n]
+
+
+DISCLAIMER_SAME_DAY = ("این جدول اشخاصی را نشان می‌دهد که در یک روز مشخص هم خریدار و هم فروشنده همان نماد بوده‌اند. "
+                        "چون ساعت دقیق سفارش‌ها در داده موجود نیست، سود/زیان صرفاً بر مبنای اختلاف میانگین نرخ خرید و "
+                        "فروش همان روز است، نه تطبیق دقیق لات به لات (FIFO/LIFO واقعی نامعلوم است).")
+
+
+def top_short_term_traders(conn, start=None, end=None, top_n: int = 20, min_trades: int = 3) -> list[dict]:
+    """
+    محاسبه امتیاز برای تمام اشخاصی که هم خرید و هم فروش داشته‌اند (پیش‌شرط لازم برای نوسان‌گیری)،
+    و برگرداندن Top N بر اساس امتیاز.
+    """
+    where, params = _date_filter(start, end)
+    candidate_ids = [r[0] for r in conn.execute(f"""
+        SELECT p.person_id FROM persons p
+        WHERE p.person_id IN (SELECT buyer_person_id FROM transactions t WHERE {where})
+          AND p.person_id IN (SELECT seller_person_id FROM transactions t WHERE {where})
+    """, params + params).fetchall()]
+
+    names = dict(conn.execute("SELECT person_id, name_raw FROM persons"))
+    results = []
+    for pid in candidate_ids:
+        res = short_term_behavior_score(conn, pid, start, end)
+        if res["components"].get("active_days", 0) == 0:
+            continue
+        n_tx = res["components"]["n_round_trips"] + 1
+        if n_tx < min_trades:
+            continue
+        results.append({
+            "person_id": pid, "name": names.get(pid),
+            "score": res["score"], "level": res["level"],
+            "n_round_trips": res["components"]["n_round_trips"],
+            "active_days": res["components"]["active_days"],
+        })
+    return sorted(results, key=lambda x: x["score"], reverse=True)[:top_n]
+
+
+if __name__ == "__main__":
+    import pathlib
+    db_path = str(pathlib.Path(__file__).resolve().parents[2] / "data" / "smart_equity.db")
+    conn = sqlite3.connect(db_path)
+    top = top_short_term_traders(conn, top_n=10)
+    print(f"Candidates with both buy & sell activity, top 10 by short-term score:")
+    for t in top:
+        print(f"  score={t['score']:5.1f}  level={t['level']:35s} round_trips={t['n_round_trips']:3d} "
+              f"active_days={t['active_days']:3d}  name={t['name']}")
+    if top:
+        detail = short_term_behavior_score(conn, top[0]["person_id"])
+        print()
+        print("Detail for top candidate:")
+        print(" score:", detail["score"], detail["level"])
+        print(" components:", detail["components"])
+        print(" disclaimer:", detail["disclaimer"])

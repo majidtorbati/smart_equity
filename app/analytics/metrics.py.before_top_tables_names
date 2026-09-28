@@ -1,0 +1,229 @@
+"""
+Analytics Engine — تمام محاسبات هسته‌ای.
+اصل: هیچ عددی تقریبی/فرضی نیست؛ همه چیز از SQL روی داده واقعی محاسبه می‌شود.
+پیش‌فرض: معاملات duplicate-flag شده (is_duplicate_of NOT NULL) از محاسبات کنار گذاشته می‌شوند
+چون نسخه اصلی آن‌ها (is_duplicate_of IS NULL) قبلاً لحاظ شده است.
+"""
+from __future__ import annotations
+import sqlite3
+
+BASE_FILTER = "t.is_duplicate_of IS NULL"
+
+
+def _date_filter(start: str = None, end: str = None) -> tuple[str, list]:
+    clauses = [BASE_FILTER]
+    params = []
+    if start:
+        clauses.append("t.trade_date_gregorian >= ?")
+        params.append(start)
+    if end:
+        clauses.append("t.trade_date_gregorian <= ?")
+        params.append(end)
+    return " AND ".join(clauses), params
+
+
+def overview(conn: sqlite3.Connection, start=None, end=None) -> dict:
+    where, params = _date_filter(start, end)
+    row = conn.execute(f"""
+        SELECT
+            COUNT(*) as n_tx,
+            COALESCE(SUM(t.quantity),0) as total_qty,
+            COALESCE(SUM(t.value),0) as total_value,
+            COUNT(DISTINCT t.buyer_person_id) as n_buyers,
+            COUNT(DISTINCT t.seller_person_id) as n_sellers,
+            COUNT(DISTINCT t.buyer_broker_id) + COUNT(DISTINCT t.seller_broker_id) as n_broker_touches,
+            MAX(t.value) as largest_tx_value,
+            MIN(t.trade_date_gregorian) as first_date,
+            MAX(t.trade_date_gregorian) as last_date
+        FROM transactions t WHERE {where}
+    """, params).fetchone()
+    n_tx, total_qty, total_value, n_buyers, n_sellers, n_broker_touches, largest, first_d, last_d = row
+    wavg = (total_value / total_qty) if total_qty else 0
+    return {
+        "n_transactions": n_tx,
+        "total_quantity": total_qty,
+        "total_value": total_value,
+        "weighted_avg_price": wavg,
+        "n_unique_buyers": n_buyers,
+        "n_unique_sellers": n_sellers,
+        "largest_transaction_value": largest,
+        "first_date": first_d,
+        "last_date": last_d,
+    }
+
+
+def price_series(conn, start=None, end=None) -> list[dict]:
+    """قیمت وزنی و حجم روزانه، برای رسم نمودار و محاسبه بازده."""
+    where, params = _date_filter(start, end)
+    rows = conn.execute(f"""
+        SELECT t.trade_date_gregorian,
+               SUM(t.quantity) as qty,
+               SUM(t.value) as val,
+               MIN(t.price) as low,
+               MAX(t.price) as high
+        FROM transactions t WHERE {where}
+        GROUP BY t.trade_date_gregorian ORDER BY t.trade_date_gregorian
+    """, params).fetchall()
+    out = []
+    for d, qty, val, low, high in rows:
+        out.append({
+            "date": d,
+            "volume": qty,
+            "value": val,
+            "weighted_avg_price": (val / qty) if qty else 0,
+            "low": low,
+            "high": high,
+        })
+    return out
+
+
+def top_brokers(conn, side: str, start=None, end=None, top_n: int = 10) -> list[dict]:
+    """
+    side: 'buyer' or 'seller'
+    برمی‌گرداند: رتبه‌بندی کارگزاران بر اساس ارزش معاملات آن سمت.
+    """
+    assert side in ("buyer", "seller")
+    broker_col = f"{side}_broker_id"
+    where, params = _date_filter(start, end)
+    rows = conn.execute(f"""
+        SELECT b.broker_id, b.broker_name_raw, b.broker_name_key,
+               SUM(t.quantity) as qty, SUM(t.value) as val, COUNT(*) as n_tx,
+               COUNT(DISTINCT t.{'seller_person_id' if side=='buyer' else 'buyer_person_id'}) as n_counterparties
+        FROM transactions t JOIN brokers b ON t.{broker_col} = b.broker_id
+        WHERE {where}
+        GROUP BY b.broker_id ORDER BY val DESC LIMIT ?
+    """, params + [top_n]).fetchall()
+    from app.config.settings import get_primary_market_maker_names
+    from app.core.normalize import normalize_key
+    mm_keys = {normalize_key(n) for n in get_primary_market_maker_names()}
+    return [
+        {"broker_id": r[0], "broker_name": r[1], "is_primary_market_maker": r[2] in mm_keys,
+         "quantity": r[3], "value": r[4], "n_transactions": r[5], "n_counterparties": r[6]}
+        for r in rows
+    ]
+
+
+def broker_net_position(conn, start=None, end=None, top_n: int = 10) -> dict:
+    """خالص خرید/فروش هر کارگزار (Net Value = Buy Value - Sell Value)."""
+    where, params = _date_filter(start, end)
+    buy_rows = {r[0]: r[1] for r in conn.execute(
+        f"SELECT buyer_broker_id, SUM(value) FROM transactions t WHERE {where} GROUP BY buyer_broker_id", params)}
+    sell_rows = {r[0]: r[1] for r in conn.execute(
+        f"SELECT seller_broker_id, SUM(value) FROM transactions t WHERE {where} GROUP BY seller_broker_id", params)}
+    broker_ids = set(buy_rows) | set(sell_rows)
+    names = dict(conn.execute("SELECT broker_id, broker_name_raw FROM brokers"))
+    result = []
+    for bid in broker_ids:
+        buy_v = buy_rows.get(bid, 0) or 0
+        sell_v = sell_rows.get(bid, 0) or 0
+        result.append({"broker_id": bid, "broker_name": names.get(bid), "buy_value": buy_v,
+                        "sell_value": sell_v, "net_value": buy_v - sell_v})
+    top_net_buy = sorted(result, key=lambda x: x["net_value"], reverse=True)[:top_n]
+    top_net_sell = sorted(result, key=lambda x: x["net_value"])[:top_n]
+    return {"top_net_buyers": top_net_buy, "top_net_sellers": top_net_sell}
+
+
+def top_persons(conn, side: str, start=None, end=None, top_n: int = 10, by: str = "value") -> list[dict]:
+    assert side in ("buyer", "seller")
+    assert by in ("value", "quantity", "n_trades")
+    person_col = f"{side}_person_id"
+    broker_col = f"{side}_broker_id"
+    where, params = _date_filter(start, end)
+    order_col = {"value": "SUM(t.value)", "quantity": "SUM(t.quantity)", "n_trades": "COUNT(*)"}[by]
+    rows = conn.execute(f"""
+        SELECT p.person_id, p.name_raw, p.person_type, p.identifier_confidence,
+               SUM(t.quantity) as qty, SUM(t.value) as val, COUNT(*) as n_tx,
+               COUNT(DISTINCT t.trade_date_gregorian) as active_days,
+               MIN(t.trade_date_gregorian) as first_seen, MAX(t.trade_date_gregorian) as last_seen
+        FROM transactions t JOIN persons p ON t.{person_col} = p.person_id
+        WHERE {where}
+        GROUP BY p.person_id ORDER BY {order_col} DESC LIMIT ?
+    """, params + [top_n]).fetchall()
+    return [
+        {"person_id": r[0], "name": r[1], "type": r[2], "id_confidence": r[3],
+         "quantity": r[4], "value": r[5], "n_transactions": r[6],
+         "active_days": r[7], "first_seen": r[8], "last_seen": r[9]}
+        for r in rows
+    ]
+
+
+def net_position_persons(conn, start=None, end=None, top_n=10) -> dict:
+    where, params = _date_filter(start, end)
+    buy = {r[0]: (r[1], r[2]) for r in conn.execute(
+        f"SELECT buyer_person_id, SUM(value), SUM(quantity) FROM transactions t WHERE {where} GROUP BY buyer_person_id", params)}
+    sell = {r[0]: (r[1], r[2]) for r in conn.execute(
+        f"SELECT seller_person_id, SUM(value), SUM(quantity) FROM transactions t WHERE {where} GROUP BY seller_person_id", params)}
+    names = dict(conn.execute("SELECT person_id, name_raw FROM persons"))
+    ids = set(buy) | set(sell)
+    out = []
+    for pid in ids:
+        bv, bq = buy.get(pid, (0, 0))
+        sv, sq = sell.get(pid, (0, 0))
+        out.append({"person_id": pid, "name": names.get(pid),
+                     "net_value": (bv or 0) - (sv or 0), "net_quantity": (bq or 0) - (sq or 0)})
+    return {
+        "top_net_buyers": sorted(out, key=lambda x: x["net_value"], reverse=True)[:top_n],
+        "top_net_sellers": sorted(out, key=lambda x: x["net_value"])[:top_n],
+    }
+
+
+def individual_vs_institutional(conn, start=None, end=None) -> dict:
+    where, params = _date_filter(start, end)
+    rows = conn.execute(f"""
+        SELECT p.person_type, SUM(t.value)
+        FROM transactions t JOIN persons p ON t.buyer_person_id = p.person_id
+        WHERE {where} GROUP BY p.person_type
+    """, params).fetchall()
+    buy_by_type = dict(rows)
+    rows2 = conn.execute(f"""
+        SELECT p.person_type, SUM(t.value)
+        FROM transactions t JOIN persons p ON t.seller_person_id = p.person_id
+        WHERE {where} GROUP BY p.person_type
+    """, params).fetchall()
+    sell_by_type = dict(rows2)
+    types = set(buy_by_type) | set(sell_by_type)
+    return {t: {"buy_value": buy_by_type.get(t, 0), "sell_value": sell_by_type.get(t, 0),
+                "net_value": buy_by_type.get(t, 0) - sell_by_type.get(t, 0)} for t in types}
+
+
+def concentration(conn, side: str, start=None, end=None) -> dict:
+    """
+    Concentration بر اساس ارزش معاملات یک سمت (خریدار یا فروشنده)، سطح شخص.
+    HHI = sum(share_i^2) * 10000  (مقیاس استاندارد 0..10000)
+    """
+    assert side in ("buyer", "seller")
+    persons = top_persons(conn, side, start, end, top_n=100000, by="value")
+    total = sum(p["value"] for p in persons) or 1
+    persons_sorted = sorted(persons, key=lambda x: x["value"], reverse=True)
+    top1 = sum(p["value"] for p in persons_sorted[:1]) / total * 100
+    top5 = sum(p["value"] for p in persons_sorted[:5]) / total * 100
+    top10 = sum(p["value"] for p in persons_sorted[:10]) / total * 100
+    hhi = sum((p["value"] / total) ** 2 for p in persons_sorted) * 10000
+    if hhi < 1500:
+        level = "Low concentration"
+    elif hhi < 2500:
+        level = "Medium concentration"
+    else:
+        level = "High concentration"
+    return {"top1_share_pct": top1, "top5_share_pct": top5, "top10_share_pct": top10,
+            "hhi": hhi, "level": level, "n_participants": len(persons_sorted)}
+
+
+if __name__ == "__main__":
+    import pathlib
+    db_path = str(pathlib.Path(__file__).resolve().parents[2] / "data" / "smart_equity.db")
+    conn = sqlite3.connect(db_path)
+    print("=== Overview (full range) ===")
+    ov = overview(conn)
+    for k, v in ov.items():
+        print(f"  {k}: {v}")
+    print()
+    print("=== Top 5 buyer persons by value ===")
+    for p in top_persons(conn, "buyer", top_n=5):
+        print(" ", p)
+    print()
+    print("=== Concentration (buyers) ===")
+    print(concentration(conn, "buyer"))
+    print()
+    print("=== Individual vs Institutional ===")
+    print(individual_vs_institutional(conn))

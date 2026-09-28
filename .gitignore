@@ -1,0 +1,10 @@
+﻿build_venv/
+dist/
+build/
+__pycache__/
+*.pyc
+*.db
+*.xlsx
+*.xls
+*.pptx
+*.pdf

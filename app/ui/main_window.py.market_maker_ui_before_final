@@ -1,0 +1,2735 @@
+﻿"""
+Smart Equity Transaction Intelligence — Desktop GUI (PySide6)
+سامانه هوشمند تحلیل معاملات سهام
+"""
+from __future__ import annotations
+import sys
+import pathlib
+import sqlite3
+import json
+
+from app.core.runtime import runtime_root
+from app.core.font_manager import (
+    installed_font_families,
+    default_heading_font,
+    default_body_font,
+)
+ROOT = runtime_root()
+sys.path.insert(0, str(ROOT))
+
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QBoxLayout,
+    QWidget,
+    QListWidget,
+    QListWidgetItem,
+    QStackedWidget,
+    QHBoxLayout,
+    QVBoxLayout,
+    QLabel,
+    QFrame,
+    QGridLayout,
+    QLayout,
+    QTableWidget,
+    QTableWidgetItem,
+    QPushButton,
+    QLineEdit,
+    QFileDialog,
+    QMessageBox,
+    QHeaderView,
+    QSplitter,
+    QScrollArea,
+    QGroupBox,
+    QTabWidget,
+    QAbstractItemView,
+    QSizePolicy,
+    QComboBox,
+    QPlainTextEdit,
+    QFontComboBox,
+    QToolTip,
+)
+from PySide6.QtCore import QRect, Qt, QTimer, QRunnable, QThreadPool, QObject, Signal
+from PySide6.QtGui import QFontDatabase, QFont, QPixmap, QColor
+from PySide6.QtCharts import QChart, QChartView, QLineSeries, QBarSeries, QBarSet, QBarCategoryAxis, QCategoryAxis, QValueAxis
+
+from app.ui.style import APP_STYLESHEET, FONT_PATH, COLOR_GOOD, COLOR_BAD
+from app.core.jalali import to_jalali_str, gregorian_to_jalali, jalali_date_display, jalali_datetime_display
+import datetime as dt
+from app.data.import_engine import import_excel, init_db
+from app.data.registry_engine import import_registry, reconcile_identities
+from app.data.project_import import import_project
+from app.analytics import metrics as m
+from app.analytics import dashboard as dash
+from app.detection import anomaly as an
+from app.detection import behavior as bh
+from app.export.excel_report import generate_excel_report
+from app.export.pdf_report import generate_pdf_report
+from app.export.pptx_report import generate_pptx_report
+from app.core.labels import alert_type_fa, severity_fa
+from app.analytics import market_maker as mm_mod
+from app.analytics import comparison as comp
+from app.analytics import portfolio as pf
+from app.ai.assistant import generate_analysis
+from app.config.settings import (load_settings, save_settings, get_company_name, get_report_prepared_by,
+                                  get_report_audience, get_report_title, get_primary_market_maker_names,
+                                  get_logo_path, set_logo, remove_logo,
+                                  DEVELOPER_CREDIT_LINE)
+
+DB_PATH = ROOT / "data" / "smart_equity.db"
+
+
+def fmt_num(x):
+    try:
+        return f"{x:,.0f}"
+    except Exception:
+        return str(x)
+
+
+def fmt_delta_num(x):
+    """برای جدول مقایسه: اعداد صحیح بزرگ (مثل ارزش/تعداد) بدون اعشار، مقادیر کسری (قیمت/HHI) با دو رقم اعشار."""
+    if not isinstance(x, (int, float)):
+        return x
+    if float(x).is_integer():
+        return f"{x:,.0f}"
+    return f"{x:,.2f}"
+
+
+def jalali_to_greg_str(jalali_str: str) -> str | None:
+    """ورودی '1405/03/13' -> '2026-06-03'."""
+    if not jalali_str or not jalali_str.strip():
+        return None
+    try:
+        parts = jalali_str.strip().replace("-", "/").split("/")
+        jy, jm, jd = int(parts[0]), int(parts[1]), int(parts[2])
+        from app.core.jalali import jalali_to_gregorian
+        return jalali_to_gregorian(jy, jm, jd).isoformat()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Reusable widgets
+# ---------------------------------------------------------------------------
+
+class KpiCard(QFrame):
+    def __init__(self, label: str):
+        super().__init__()
+        self.setObjectName("kpiCard")
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setFrameShadow(QFrame.Raised)
+        self.setMinimumHeight(60)
+        self.setMaximumWidth(190)
+        
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(3)
+        self.value_label = QLabel("—")
+        self.value_label.setObjectName("kpiValue")
+        self.value_label.setAlignment(Qt.AlignCenter)
+
+        title_label = QLabel(label)
+        title_label.setObjectName("kpiLabel")
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setWordWrap(True)
+
+        lay.addWidget(title_label)
+        lay.addWidget(self.value_label)
+    def set_value(self, value: str):
+        self.value_label.setText(value)
+
+
+def make_table(headers: list[str]) -> QTableWidget:
+    t = QTableWidget(0, len(headers))
+    t.setHorizontalHeaderLabels(headers)
+    t.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+    t.horizontalHeader().setMinimumSectionSize(70)
+    t.setLayoutDirection(Qt.RightToLeft)
+    t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    t.setSelectionBehavior(QAbstractItemView.SelectRows)
+    t.setSortingEnabled(True)
+    t.setAlternatingRowColors(True)
+    return t
+
+
+class NumericTableWidgetItem(QTableWidgetItem):
+    """
+    QTableWidgetItem معمولی وقتی DisplayRole عدد اعشاری بزرگ باشد، هنگام رسم (نه در .text())
+    آن را با فرمت‌دهی QLocale به نماد علمی تبدیل می‌کند (مثلاً 6.06742e+10 به‌جای 60,674,204,694).
+    این کلاس متن نمایشی را از قبل به‌صورت رشته‌ی تمیز می‌سازد و مرتب‌سازی عددی صحیح را
+    با نگه‌داشتن مقدار خام برای مقایسه (نه بر اساس متن) تضمین می‌کند.
+    """
+    def __init__(self, raw_value):
+        super().__init__(fmt_delta_num(raw_value))
+        self._raw = raw_value
+
+    def __lt__(self, other):
+        if isinstance(other, NumericTableWidgetItem):
+            try:
+                return self._raw < other._raw
+            except (TypeError, ValueError):
+                return self.text() < other.text()
+
+        return self.text() < other.text()
+
+
+def fill_table(table: QTableWidget, rows: list[list], default_sort_col: int = None, descending: bool = True):
+    table.setSortingEnabled(False)
+    table.setRowCount(len(rows))
+    for r, row in enumerate(rows):
+        for c, val in enumerate(row):
+            if isinstance(val, (int, float)):
+                item = NumericTableWidgetItem(val)
+            else:
+                item = QTableWidgetItem(str(val))
+            table.setItem(r, c, item)
+    table.setSortingEnabled(True)
+    # Qt.setSortingEnabled(True) silently applies its own default sort (usually column 0)
+    # which would scramble an intentionally value-ordered result set. Force the intended sort.
+    if default_sort_col is not None:
+        order = Qt.DescendingOrder if descending else Qt.AscendingOrder
+        table.sortByColumn(default_sort_col, order)
+    else:
+        # no natural rank column (e.g. a heterogeneous metrics table) -> keep insertion order,
+        # column -1 clears Qt's sort indicator instead of silently re-sorting by column 0.
+        table.sortByColumn(-1, Qt.AscendingOrder)
+
+
+def make_search_box(placeholder: str = "جستجوی نام...") -> QLineEdit:
+    box = QLineEdit()
+    box.setPlaceholderText(placeholder)
+    box.setClearButtonEnabled(True)
+    return box
+
+
+def apply_table_filter(table: QTableWidget, query: str, column: int | None = 0):
+    """
+    ردیف‌های جدول را بر اساس متن جستجو پنهان/نمایان می‌کند (بدون واکشی مجدد از دیتابیس).
+    column=0 یعنی فقط ستون نام بررسی شود (چون در تمام جدول‌های این برنامه، ستون منطقی ۰ همیشه
+    «نام»/«نام کارگزار» است — جهت راست‌به‌چپ فقط محل نمایش را برمی‌گرداند، نه اندیس منطقی ستون).
+    column=None یعنی همه‌ی ستون‌های آن ردیف بررسی شوند (برای جدول‌هایی مثل هشدارها که نام ممکن
+    است داخل متن توضیح ظاهر شود، نه در یک ستون ثابت).
+    """
+    query = query.strip().lower()
+    for row in range(table.rowCount()):
+        if not query:
+            table.setRowHidden(row, False)
+            continue
+        if column is not None:
+            item = table.item(row, column)
+            matched = bool(item) and query in item.text().lower()
+        else:
+            matched = False
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                if item and query in item.text().lower():
+                    matched = True
+                    break
+        table.setRowHidden(row, not matched)
+
+
+# ---------------------------------------------------------------------------
+# Pages
+# ---------------------------------------------------------------------------
+
+class DashboardPage(QWidget):
+    def __init__(self):
+        super().__init__()
+        # =========================================================
+        # Advanced Dashboard - Phase 9 UI Structure
+        # =========================================================
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        # ---------------------------------------------------------
+        # Scrollable dashboard
+        # ---------------------------------------------------------
+        self.dashboard_scroll = QScrollArea()
+        self.dashboard_scroll.setWidgetResizable(True)
+        self.dashboard_scroll.setFrameShape(QFrame.NoFrame)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(8, 8, 8, 8)
+        content_layout.setSpacing(12)
+
+        # ---------------------------------------------------------
+        # Header
+        # ---------------------------------------------------------
+        title = QLabel("داشبورد مدیریتی")
+        title.setObjectName("dashboardPageTitle")
+        content_layout.addWidget(title)
+
+        subtitle = QLabel(
+            "نمای کلی معاملات، بازیگران، کارگزاران و تحلیل‌های پیشرفته"
+        )
+        subtitle.setObjectName("dashboardPageSubtitle")
+        content_layout.addWidget(subtitle)
+
+        # ---------------------------------------------------------
+        # KPI section
+        # ---------------------------------------------------------
+        kpi_title = QLabel("شاخص‌های کلیدی")
+        kpi_title.setObjectName("dashboardSectionTitle")
+        content_layout.addWidget(kpi_title)
+
+        kpi_grid = QGridLayout()
+        kpi_grid.setHorizontalSpacing(6)
+        kpi_grid.setVerticalSpacing(10)
+
+        for col in range(4):
+            kpi_grid.setColumnStretch(col, 0)
+
+        for row in range(2):
+            kpi_grid.setRowStretch(row, 0)
+
+        self.kpi_tx = KpiCard("تعداد معاملات")
+        self.kpi_value = KpiCard("ارزش کل (ریال)")
+        self.kpi_qty = KpiCard("حجم کل")
+        self.kpi_price = KpiCard("قیمت روز سهام")
+        self.kpi_buyers = KpiCard("خریداران منحصربه‌فرد")
+        self.kpi_sellers = KpiCard("فروشندگان منحصربه‌فرد")
+        self.kpi_largest = KpiCard("بزرگترین معامله (ریال)")
+        self.kpi_alerts = KpiCard("تعداد هشدار")
+
+        kpi_cards = [
+            self.kpi_tx,
+            self.kpi_value,
+            self.kpi_qty,
+            self.kpi_price,
+            self.kpi_buyers,
+            self.kpi_sellers,
+            self.kpi_largest,
+            self.kpi_alerts,
+        ]
+
+        # KPI cards: explicit right-to-left visual order
+        # Column 3 is the rightmost column because the grid itself
+        # uses LeftToRight layout direction for deterministic placement.
+
+        for i, card in enumerate(kpi_cards):
+            row = i // 4
+            col = 3 - (i % 4)
+            kpi_grid.addWidget(card, row, col)
+            
+        kpi_container = QWidget()
+        kpi_container.setMaximumWidth(1100)
+
+        kpi_container_layout = QVBoxLayout(kpi_container)
+        kpi_container_layout.setContentsMargins(0, 0, 0, 0)
+        kpi_container_layout.addLayout(kpi_grid)
+
+        content_layout.addWidget(kpi_container)
+
+        # ---------------------------------------------------------
+        # Main chart
+        # ---------------------------------------------------------
+        main_chart_box = QGroupBox()
+        main_chart_box.setMaximumWidth(1100)
+        main_chart_box.setObjectName("dashboardChartBox")
+
+        main_chart_layout = QVBoxLayout(main_chart_box)
+        main_chart_layout.setContentsMargins(10, 10, 10, 10)
+        main_chart_layout.setSpacing(6)
+
+        chart_title = QLabel("روند معاملات و قیمت")
+        chart_title.setAlignment(Qt.AlignCenter)
+        chart_title.setObjectName("dashboardChartTitle")
+
+        main_chart_layout.addWidget(chart_title)
+
+        self.price_chart_view = QChartView()
+        self.price_chart_view.setMinimumHeight(220)
+        main_chart_layout.addWidget(self.price_chart_view)
+
+        content_layout.addWidget(main_chart_box)
+
+        # ---------------------------------------------------------
+        # Broker chart - compatibility with current refresh()
+        # ---------------------------------------------------------
+        # Compatibility view for the current refresh()
+        # It remains available but is not displayed in the new Dashboard layout.
+        self.broker_chart_view = QChartView()
+        self.broker_chart_view.setMinimumHeight(220)
+
+
+        # ---------------------------------------------------------
+        # Concentration
+        # ---------------------------------------------------------
+        concentration_container = QWidget()
+        concentration_container.setMaximumWidth(1100)
+
+        concentration_layout = QHBoxLayout(concentration_container)
+        concentration_layout.setContentsMargins(0, 0, 0, 0)
+        concentration_layout.setSpacing(6)
+
+        self.buyer_concentration_box = QGroupBox("تمرکز خرید بر اساس Top 1 / 5 / 10")
+
+        self.buyer_concentration_layout = QVBoxLayout(
+            self.buyer_concentration_box
+        )
+        self.buyer_concentration_layout.addWidget(
+            QLabel("خلاصه تمرکز خرید خریداران")
+        )
+
+        self.seller_concentration_box = QGroupBox("تمرکز فروش بر اساس Top 1 / 5 / 10")
+
+        self.seller_concentration_layout = QVBoxLayout(
+            self.seller_concentration_box
+        )
+        self.seller_concentration_layout.addWidget(
+            QLabel("خلاصه تمرکز فروش فروشندگان")
+        )
+
+        concentration_layout.addWidget(
+            self.seller_concentration_box,
+            1
+        )
+
+        concentration_layout.addWidget(
+            self.buyer_concentration_box,
+            1
+        )
+
+        concentration_layout.setStretch(0, 1)
+        concentration_layout.setStretch(1, 1)
+
+        content_layout.addWidget(concentration_container)
+        # Top players
+        # ---------------------------------------------------------
+        players_grid = QGridLayout()
+        
+        self.top_buyers_box = QGroupBox("خریداران برتر")
+        self.top_buyers_layout = QVBoxLayout(self.top_buyers_box)
+        self.top_buyers_layout.addWidget(
+            QLabel("جدول خریداران برتر")
+        )
+
+        self.top_sellers_box = QGroupBox("فروشندگان برتر")
+        self.top_sellers_layout = QVBoxLayout(self.top_sellers_box)
+        self.top_sellers_layout.addWidget(
+            QLabel("جدول فروشندگان برتر")
+        )
+
+        players_grid.addWidget(self.top_buyers_box, 0, 0)
+        players_grid.addWidget(self.top_sellers_box, 0, 1)
+        players_grid.setColumnStretch(0, 1)
+        players_grid.setColumnStretch(1, 1)
+
+        players_container = QWidget()
+        players_container.setMaximumWidth(1100)
+        players_container_layout = QVBoxLayout(players_container)
+        players_container_layout.setContentsMargins(0, 0, 0, 0)
+        players_container_layout.addLayout(players_grid)
+
+        content_layout.addWidget(players_container)
+        # ---------------------------------------------------------
+        # Brokers / Net position
+        # ---------------------------------------------------------
+        broker_grid = QGridLayout()
+        
+        self.brokers_box = QGroupBox("کارگزاران برتر")
+        self.brokers_layout = QVBoxLayout(self.brokers_box)
+        self.brokers_layout.addWidget(
+            QLabel("تحلیل کارگزاران")
+        )
+
+        self.net_position_box = QGroupBox("موقعیت خالص")
+        self.net_position_layout = QVBoxLayout(self.net_position_box)
+        self.net_position_layout.addWidget(
+            QLabel("موقعیت خالص خرید و فروش")
+        )
+
+        broker_grid.addWidget(self.brokers_box, 0, 0)
+        broker_grid.addWidget(self.net_position_box, 0, 1)
+        broker_grid.setColumnStretch(0, 1)
+        broker_grid.setColumnStretch(1, 1)
+
+        broker_container = QWidget()
+        broker_container.setMaximumWidth(1100)
+        broker_container_layout = QVBoxLayout(broker_container)
+        broker_container_layout.setContentsMargins(0, 0, 0, 0)
+        broker_container_layout.addLayout(broker_grid)
+
+        content_layout.addWidget(broker_container)
+        # ---------------------------------------------------------
+        # Phase summaries / daily events
+        # ---------------------------------------------------------
+        phase_summary_box = QGroupBox("خلاصه تحلیل مراحل")
+        phase_summary_layout = QGridLayout(phase_summary_box)
+        phase_summary_layout.setHorizontalSpacing(6)
+        phase_summary_layout.setVerticalSpacing(2)
+        phase_summary_box.setMaximumWidth(1100)
+
+        self.phase_summary_labels = {}
+
+        phase_items = [
+            ("daily", "بازیکنان روزانه"),
+            ("new_exited", "سهامداران جدید / خارج‌شده"),
+            ("accumulation", "انباشت / توزیع"),
+            ("round_trip", "معاملات تحقق‌یافته"),
+            ("anomaly", "هشدارهای شناسایی‌شده"),
+            ("behavior", "همبستگی رفتار"),
+            ("concentration", "تمرکز معاملات"),
+            ("ownership", "تمرکز مالکیت"),
+        ]
+
+        for index, (key, title_text) in enumerate(phase_items):
+            label = QLabel(title_text)
+            label.setWordWrap(True)
+            label.setMinimumHeight(22)
+            label.setMaximumHeight(28)
+            self.phase_summary_labels[key] = label
+
+            row = index // 2
+            col = index % 2
+            phase_summary_layout.addWidget(label, row, col)
+
+        content_layout.addWidget(phase_summary_box)
+
+        # ---------------------------------------------------------
+        # Daily events / new entries
+        # ---------------------------------------------------------
+        daily_events_container = QWidget()
+        daily_events_container.setMaximumWidth(1100)
+
+        daily_events_layout = QVBoxLayout(daily_events_container)
+        daily_events_layout.setContentsMargins(0, 0, 0, 0)
+        daily_events_layout.setSpacing(4)
+
+        daily_events_box = QGroupBox("ورودی‌های جدید و رویدادهای روزانه")
+        daily_events_box_layout = QVBoxLayout(daily_events_box)
+        daily_events_box_layout.setContentsMargins(8, 8, 8, 8)
+        daily_events_box_layout.setSpacing(4)
+
+        self.daily_status_label = QLabel()
+        self.daily_status_label.setWordWrap(True)
+        self.daily_status_label.setMaximumHeight(28)
+        daily_events_box_layout.addWidget(self.daily_status_label)
+
+        self.daily_events_label = QLabel()
+        self.daily_events_label.setWordWrap(True)
+        self.daily_events_label.setMaximumHeight(28)
+        daily_events_box_layout.addWidget(self.daily_events_label)
+
+        self.daily_events_table = QTableWidget()
+        self.daily_events_table.setObjectName("dailyEventsTable")
+        self.daily_events_table.setColumnCount(10)
+        self.daily_events_table.setHorizontalHeaderLabels([
+            "\u062a\u0627\u0631\u06cc\u062e",
+            "\u0646\u0627\u0645 \u0648 \u0646\u0627\u0645 \u062e\u0627\u0646\u0648\u0627\u062f\u06af\u06cc",
+             "\u0646\u0648\u0639 \u0631\u0648\u06cc\u062f\u0627\u062f",
+            "\u0645\u0648\u062c\u0648\u062f\u06cc \u0642\u0628\u0644",
+            "\u062e\u0631\u06cc\u062f",
+            "\u0641\u0631\u0648\u0634",
+            "\u0645\u0648\u062c\u0648\u062f\u06cc \u0628\u0639\u062f",
+            "\u0646\u0633\u0628\u062a \u0641\u0631\u0648\u0634",
+            "\u0648\u0636\u0639\u06cc\u062a",
+            "\u0627\u0637\u0645\u06cc\u0646\u0627\u0646 \u062a\u0637\u0628\u06cc\u0642",
+        ])
+        header = self.daily_events_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setMinimumSectionSize(70)
+
+        column_widths = [
+            90,   # ?????
+            190,  # ???????
+            145,  # ??? ??????
+            105,  # ?????? ???
+            95,   # ????
+            95,   # ????
+            105,  # ?????? ???
+            100,  # ???? ????
+            150,  # ????? Registry
+            100,  # ??????? ?????
+        ]
+
+        for column, width in enumerate(column_widths):
+            self.daily_events_table.setColumnWidth(column, width)
+
+        self.daily_events_table.setMinimumHeight(150)
+        daily_events_box_layout.addWidget(self.daily_events_table)
+
+        daily_events_layout.addWidget(daily_events_box)
+        content_layout.addWidget(daily_events_container)
+
+        ownership_box = QGroupBox("خلاصه مالکیت")
+        ownership_box.setMaximumWidth(1100)
+        ownership_layout = QVBoxLayout(ownership_box)
+
+        self.ownership_summary_label = QLabel()
+        self.ownership_summary_label.setWordWrap(True)
+        ownership_layout.addWidget(self.ownership_summary_label)
+
+        content_layout.addWidget(ownership_box)
+        # Methodology / coverage
+        # ---------------------------------------------------------
+        note_container = QWidget()
+        note_container.setMaximumWidth(1100)
+
+        note_layout_outer = QVBoxLayout(note_container)
+        note_layout_outer.setContentsMargins(0, 0, 0, 0)
+
+        note_box = QGroupBox("دامنه و روش تحلیل")
+        note_layout = QVBoxLayout(note_box)
+
+        self.dashboard_methodology_label = QLabel(
+            "شاخص‌های دوره انتخاب‌شده از بازه تحلیل پیروی می‌کنند. "
+            "تحلیل‌های فازهای قبلی بر اساس کل داده‌های موجود محاسبه می‌شوند."
+        )
+        self.dashboard_methodology_label.setWordWrap(True)
+
+        note_layout.addWidget(self.dashboard_methodology_label)
+
+        note_layout_outer.addWidget(note_box)
+        content_layout.addWidget(note_container)
+
+        content_layout.addStretch(1)
+
+        self.dashboard_scroll.setWidget(content)
+        root.addWidget(self.dashboard_scroll)
+    def copy_daily_events_table(self) -> None:
+        table = self.daily_events_table
+
+        selected_rows = sorted({
+            index.row()
+            for index in table.selectionModel().selectedRows()
+        })
+
+        if not selected_rows:
+            selected_rows = list(range(table.rowCount()))
+
+        headers = [
+            table.horizontalHeaderItem(column).text()
+            for column in range(table.columnCount())
+        ]
+
+        lines = ["\\t".join(headers)]
+
+        for row in selected_rows:
+            values = []
+            for column in range(table.columnCount()):
+                item = table.item(row, column)
+                values.append(item.text() if item else "")
+            lines.append("\\n".join(["\\t".join(values)]))
+
+        QApplication.clipboard().setText("\\n".join(lines))
+
+    def export_daily_events_table(self) -> None:
+        table = self.daily_events_table
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "????? ????? ????????? ??????",
+            "daily_events.csv",
+            "CSV Files (*.csv)",
+        )
+
+        if not file_path:
+            return
+
+        import csv
+
+        headers = [
+            table.horizontalHeaderItem(column).text()
+            for column in range(table.columnCount())
+        ]
+
+        with open(
+            file_path,
+            "w",
+            encoding="utf-8-sig",
+            newline="",
+        ) as file:
+            writer = csv.writer(file)
+            writer.writerow(headers)
+
+            for row in range(table.rowCount()):
+                writer.writerow([
+                    table.item(row, column).text()
+                    if table.item(row, column)
+                    else ""
+                    for column in range(table.columnCount())
+                ])
+
+    def refresh(self, conn, start, end):
+        ov = m.overview(conn, start, end)
+        self.kpi_tx.set_value(fmt_num(ov["n_transactions"]))
+        self.kpi_value.set_value(fmt_num(ov["total_value"]))
+        self.kpi_qty.set_value(fmt_num(ov["total_quantity"]))
+        series_data = m.price_series(conn, start, end)
+        if series_data:
+            self.kpi_price.set_value(fmt_num(series_data[-1]["high"]))
+        else:
+            self.kpi_price.set_value("—")
+        self.kpi_buyers.set_value(fmt_num(ov["n_unique_buyers"]))
+        self.kpi_sellers.set_value(fmt_num(ov["n_unique_sellers"]))
+        self.kpi_largest.set_value(fmt_num(ov["largest_transaction_value"]))
+        alerts = an.run_all_anomaly_detectors(conn, start, end)
+        self.kpi_alerts.set_value(fmt_num(len(alerts)))
+
+        # price chart
+        chart = QChart()
+        chart.setBackgroundBrush(QColor("#FFFFFF"))
+        chart.setTitle("روند قیمت روزانه سهم")
+
+        line = QLineSeries()
+        line.setName("بیشترین قیمت روزانه")
+
+        categories = []
+        valid_highs = []
+
+        for i, d in enumerate(series_data):
+            high = float(d["high"] or 0)
+            line.append(float(i), high)
+            valid_highs.append(high)
+            g_date = dt.date.fromisoformat(d["date"])
+            categories.append(to_jalali_str(g_date)[5:])
+
+        chart.addSeries(line)
+        # Tooltip for daily price points
+        def show_price_tooltip(point, state):
+            if not state:
+                return
+
+            index = int(round(point.x()))
+            if 0 <= index < len(series_data):
+                d = series_data[index]
+                g_date = dt.date.fromisoformat(d["date"])
+                jalali_date = to_jalali_str(g_date)
+
+                # Use the actual chart-view position of the hovered point.
+                chart_pos = self.price_chart_view.chart().mapToPosition(point, line)
+                tooltip_pos = self.price_chart_view.mapToGlobal(
+                    chart_pos.toPoint()
+                )
+
+                QToolTip.showText(
+                    tooltip_pos,
+                    f"تاریخ: {jalali_date}\n"
+                    f"بیشترین قیمت روزانه: {float(d['high']):,.0f}",
+                    self.price_chart_view,
+                    QRect(),
+                    10000
+                )
+
+        line.hovered.connect(show_price_tooltip)
+        # Numeric X axis — compatible with QLineSeries
+        axis_x = QCategoryAxis()
+        axis_x.setRange(0, max(1, len(categories) - 1))
+
+        if categories:
+            step = max(1, len(categories) // 10)
+            for idx, label in enumerate(categories):
+                if idx % step == 0 or idx == len(categories) - 1:
+                    axis_x.append(label, float(idx))
+
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        line.attachAxis(axis_x)
+
+        # Y axis uses ONLY the actual daily highest prices
+        axis_y = QValueAxis()
+        if valid_highs:
+            min_price = min(valid_highs)
+            max_price = max(valid_highs)
+
+            if min_price == max_price:
+                margin = max(1.0, min_price * 0.02)
+            else:
+                margin = (max_price - min_price) * 0.05
+
+            axis_y.setRange(
+                max(0, min_price - margin),
+                max_price + margin,
+            )
+
+        axis_y.setLabelFormat("%.0f")
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        line.attachAxis(axis_y)
+
+        chart.legend().hide()
+        self.price_chart_view.setChart(chart)
+        chart.legend().hide()
+        self.price_chart_view.setChart(chart)
+        self.price_chart_view.setChart(chart)
+
+        # top brokers bar chart
+        brokers = m.top_brokers(conn, "buyer", start, end, top_n=8)
+        chart2 = QChart()
+        chart2.setBackgroundBrush(QColor("#FFFFFF"))
+        chart2.setTitle("ارزش خرید — کارگزاران برتر")
+        bar_set = QBarSet("ارزش (ریال)")
+        categories = []
+        for b in brokers:
+            bar_set.append(b["value"])
+            categories.append((b["broker_name"] or "")[:18])
+        series = QBarSeries()
+        series.append(bar_set)
+        chart2.addSeries(series)
+        axis_x = QBarCategoryAxis()
+        axis_x.append(categories)
+        chart2.addAxis(axis_x, Qt.AlignBottom)
+        series.attachAxis(axis_x)
+        axis_y = QValueAxis()
+        chart2.addAxis(axis_y, Qt.AlignLeft)
+        series.attachAxis(axis_y)
+        chart2.legend().hide()
+        self.broker_chart_view.setChart(chart2)
+
+        # Advanced dashboard summaries
+        dashboard_data = dash.run_dashboard(conn, start, end)
+        period = dashboard_data["period"]
+        dataset = dashboard_data["dataset_analysis"]
+
+        def set_box_text(box, text):
+            layout = box.layout()
+            if layout.count() > 0:
+                widget = layout.itemAt(0).widget()
+                if widget is not None:
+                    widget.setText(text)
+                    widget.setWordWrap(True)
+                    return
+            label = QLabel(text)
+            label.setWordWrap(True)
+            layout.addWidget(label)
+
+        def pct(value):
+            return f"{float(value) * 100:.2f}%"
+
+        # Buyer / seller concentration
+        concentration = dataset["concentration"]
+        concentration_period = concentration.get("period") or {}
+        buyers_conc = concentration_period.get("buyers") or {}
+        sellers_conc = concentration_period.get("sellers") or {}
+
+        if not buyers_conc or not sellers_conc:
+            set_box_text(
+                self.buyer_concentration_box,
+                "??????? ????? ???????? ?? ?? ???? ??????? ??????? ????? ???? ??????."
+            )
+            set_box_text(
+                self.seller_concentration_box,
+                "??????? ????? ????????? ?? ?? ???? ??????? ??????? ????? ???? ??????."
+            )
+            return
+
+        set_box_text(
+            self.buyer_concentration_box,
+            f"\u062a\u0639\u062f\u0627\u062f \u062e\u0631\u06cc\u062f\u0627\u0631\u0627\u0646: {fmt_num(buyers_conc['entities'])}\n"
+            f"HHI: {fmt_num(buyers_conc['hhi'])}\n"
+            f"\u0633\u0647\u0645 \u06f1 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(buyers_conc['top1_share'])}\n"
+            f"\u0633\u0647\u0645 \u06f5 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(buyers_conc['top5_share'])}\n"
+            f"\u0633\u0647\u0645 \u06f1\u06f0 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(buyers_conc['top10_share'])}"
+        )
+
+        set_box_text(
+            self.seller_concentration_box,
+            f"\u062a\u0639\u062f\u0627\u062f \u0641\u0631\u0648\u0634\u0646\u062f\u06af\u0627\u0646: {fmt_num(sellers_conc['entities'])}\n"
+            f"HHI: {fmt_num(sellers_conc['hhi'])}\n"
+            f"\u0633\u0647\u0645 \u06f1 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(sellers_conc['top1_share'])}\n"
+            f"\u0633\u0647\u0645 \u06f5 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(sellers_conc['top5_share'])}\n"
+            f"\u0633\u0647\u0645 \u06f1\u06f0 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(sellers_conc['top10_share'])}"
+        )
+
+        # Top buyers
+        buyer_lines = ["\u062e\u0631\u06cc\u062f\u0627\u0631\u0627\u0646 \u0628\u0631\u062a\u0631 \u0628\u0631 \u0627\u0633\u0627\u0633 \u0627\u0631\u0632\u0634:"]
+        for i, row in enumerate(period["top_buyers"][:5], 1):
+            buyer_lines.append(
+                f"{i}. {row['name']} \u2014 \u0627\u0631\u0632\u0634: {fmt_num(row['value'])}"
+            )
+        set_box_text(self.top_buyers_box, "\n".join(buyer_lines))
+
+        # Top sellers
+        seller_lines = ["\u0641\u0631\u0648\u0634\u0646\u062f\u06af\u0627\u0646 \u0628\u0631\u062a\u0631 \u0628\u0631 \u0627\u0633\u0627\u0633 \u0627\u0631\u0632\u0634:"]
+        for i, row in enumerate(period["top_sellers"][:5], 1):
+            seller_lines.append(
+                f"{i}. {row['name']} \u2014 \u0627\u0631\u0632\u0634: {fmt_num(row['value'])}"
+            )
+        set_box_text(self.top_sellers_box, "\n".join(seller_lines))
+
+        # Brokers
+        broker_lines = ["\u06a9\u0627\u0631\u06af\u0632\u0627\u0631\u0627\u0646 \u0628\u0631\u062a\u0631 \u062e\u0631\u06cc\u062f:"]
+        for i, row in enumerate(period["top_buyer_brokers"][:5], 1):
+            broker_lines.append(
+                f"{i}. {row['broker_name']} \u2014 \u0627\u0631\u0632\u0634: {fmt_num(row['value'])}"
+            )
+
+        broker_lines.append("")
+        broker_lines.append("\u06a9\u0627\u0631\u06af\u0632\u0627\u0631\u0627\u0646 \u0628\u0631\u062a\u0631 \u0641\u0631\u0648\u0634:")
+
+        for i, row in enumerate(period["top_seller_brokers"][:5], 1):
+            broker_lines.append(
+                f"{i}. {row['broker_name']} \u2014 \u0627\u0631\u0632\u0634: {fmt_num(row['value'])}"
+            )
+
+        set_box_text(self.brokers_box, "\n".join(broker_lines))
+
+        # Broker net position
+        net_lines = ["\u062e\u0627\u0644\u0635 \u0627\u0631\u0632\u0634 \u062e\u0631\u06cc\u062f \u06a9\u0627\u0631\u06af\u0632\u0627\u0631\u0627\u0646:"]
+
+        for i, row in enumerate(
+            period["broker_net_position"]["top_net_buyers"][:5], 1
+        ):
+            net_lines.append(
+                f"{i}. {row['broker_name']} \u2014 \u062e\u0627\u0644\u0635: {fmt_num(row['net_value'])}"
+            )
+
+        net_lines.append("")
+        net_lines.append("\u062e\u0627\u0644\u0635 \u0627\u0631\u0632\u0634 \u0641\u0631\u0648\u0634 \u06a9\u0627\u0631\u06af\u0632\u0627\u0631\u0627\u0646:")
+
+        for i, row in enumerate(
+            period["broker_net_position"]["top_net_sellers"][:5], 1
+        ):
+            net_lines.append(
+                f"{i}. {row['broker_name']} \u2014 \u062e\u0627\u0644\u0635: {fmt_num(row['net_value'])}"
+            )
+
+        set_box_text(self.net_position_box, "\n".join(net_lines))
+
+        # Phase 1-8 summaries
+        phase2 = dataset["daily_player"]
+        phase3 = dataset["new_exited_shareholders"]
+        phase4 = dataset["accumulation_distribution"]
+        phase5 = dataset["round_trip"]
+        phase6 = dataset["anomaly"]
+        phase7 = dataset["behavior_correlation"]
+        phase8 = dataset["concentration"]
+
+        self.phase_summary_labels["daily"].setText(
+            f"بازیکنان: {fmt_num(phase2['players'])}\n"
+            f"روز-بازیکن: {fmt_num(phase2['player_days'])} | "
+            f"روزها: {fmt_num(phase2['days'])}\n"
+            f"ورود مشاهده‌شده: {fmt_num(phase2['entry_observed_count'])} | "
+            f"خروج کامل: {fmt_num(phase2['full_exit_observed_count'])}\n"
+            f"فروش سنگین: {fmt_num(phase2['heavy_sell_observed_count'])}\n"
+            f"شواهد Registry: {fmt_num(phase2['registry_evidence_rows'])} | "
+            f"جدید در Snapshot: {fmt_num(phase2['registry_new_on_snapshot_count'])}"
+        )
+        self.daily_status_label.setText(
+            f"قابل مشاهده: {fmt_num(phase2['observable_rows'])} | "
+            f"سابقه ناکافی: {fmt_num(phase2['insufficient_history_rows'])} | "
+            f"تعارض داده: {fmt_num(phase2['data_conflict_rows'])}"
+        )
+
+        self.daily_events_label.setText(
+            f"ورود مشاهده‌شده: {fmt_num(phase2['entry_observed_count'])} | "
+            f"خروج کامل: {fmt_num(phase2['full_exit_observed_count'])} | "
+            f"فروش سنگین: {fmt_num(phase2['heavy_sell_observed_count'])}"
+        )
+                # ---------------------------------------------------------
+        # Daily Player Event Details Table
+        # ---------------------------------------------------------
+        event_rows = [
+            row for row in phase2["rows"]
+            if row.get("event_type")
+        ]
+
+        person_names = {
+            int(row["person_id"]): (row["name_raw"] or "")
+            for row in conn.execute(
+                "SELECT person_id, name_raw FROM persons"
+            ).fetchall()
+        }
+
+        event_type_labels = {
+            "ENTRY_OBSERVED": "ورود مشاهده‌شده",
+            "FULL_EXIT_OBSERVED": "خروج کامل مشاهده‌شده",
+            "HEAVY_SELL_OBSERVED": "فروش سنگین مشاهده‌شده",
+        }
+        table_rows = []
+        for row in event_rows:
+            registry_status_labels = {
+                "REGISTRY_NEW_ON_SNAPSHOT": "جدید در Snapshot",
+                "REGISTRY_HISTORY_PRESENT": "دارای سابقه در Snapshot",
+                "NO_REGISTRY_MATCH": "بدون تطبیق Registry",
+            }
+
+            registry_confidence_labels = {
+                "high": "بالا",
+                "medium": "متوسط",
+                "medium-low": "متوسط-پایین",
+            }
+
+            table_rows.append([
+                row["trade_date_jalali"],
+                person_names.get(int(row["person_id"]), f"#{row['person_id']}"),
+                        event_type_labels.get(
+                    row["event_type"],
+                    row["event_type"],
+                ),
+                row["position_before"],
+                row["buy_quantity"],
+                row["sell_quantity"],
+                row["position_after"],
+                (
+                    f"{row['sell_ratio'] * 100:.1f}%"
+                    if row.get("sell_ratio") is not None
+                    else "—"
+                ),
+                registry_status_labels.get(
+                    row.get("registry_status"),
+                    row.get("registry_status") or "—",
+                ),
+                registry_confidence_labels.get(
+                    row.get("registry_match_confidence"),
+                    row.get("registry_match_confidence") or "—",
+                ),
+            ])
+        fill_table(
+            self.daily_events_table,
+            table_rows,
+            default_sort_col=0,
+            descending=True,
+        )
+        self.phase_summary_labels["new_exited"].setText(
+            f"\u0633\u0647\u0627\u0645\u062f\u0627\u0631\u0627\u0646 \u062c\u062f\u06cc\u062f: {fmt_num(phase3['new_shareholders_count'])} | "
+            f"\u062e\u0627\u0631\u062c\u200c\u0634\u062f\u0647: {fmt_num(phase3['exited_shareholders_count'])}"
+        )
+
+        self.phase_summary_labels["accumulation"].setText(
+            f"\u0631\u0648\u0632\u0647\u0627\u06cc \u0627\u0646\u0628\u0627\u0634\u062a: {fmt_num(phase4['accumulation_days'])} | "
+            f"\u062a\u0648\u0632\u06cc\u0639: {fmt_num(phase4['distribution_days'])} | "
+            f"\u062e\u0646\u062b\u06cc: {fmt_num(phase4['neutral_days'])}"
+        )
+
+        self.phase_summary_labels["round_trip"].setText(
+            f"\u062a\u0639\u062f\u0627\u062f \u0645\u0639\u0627\u0645\u0644\u0627\u062a \u062a\u062d\u0642\u0642\u200c\u06cc\u0627\u0641\u062a\u0647: {fmt_num(phase5['realizations_used'])} | "
+            f"\u0633\u0648\u062f/\u0632\u06cc\u0627\u0646 \u062a\u062d\u0642\u0642\u200c\u06cc\u0627\u0641\u062a\u0647: {fmt_num(phase5['total_realized_pnl'])}"
+        )
+
+        self.phase_summary_labels["anomaly"].setText(
+            f"\u062a\u0639\u062f\u0627\u062f \u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u0634\u0646\u0627\u0633\u0627\u06cc\u06cc\u200c\u0634\u062f\u0647: {fmt_num(phase6['alerts_count'])}"
+        )
+
+        self.phase_summary_labels["behavior"].setText(
+            f"\u062a\u0639\u062f\u0627\u062f \u0627\u0634\u062e\u0627\u0635 \u0628\u0631\u0631\u0633\u06cc\u200c\u0634\u062f\u0647: {fmt_num(phase7['persons_used'])}"
+        )
+
+        self.phase_summary_labels["concentration"].setText(
+            f"\u062e\u0631\u06cc\u062f\u0627\u0631\u0627\u0646: {fmt_num(phase8['period']['buyers']['entities'])} | "
+            f"\u0641\u0631\u0648\u0634\u0646\u062f\u06af\u0627\u0646: {fmt_num(phase8['period']['sellers']['entities'])}"
+        )
+
+        ownership = phase8["ownership"]
+
+        self.phase_summary_labels["ownership"].setText(
+            f"\u062f\u0627\u0631\u0646\u062f\u06af\u0627\u0646: {fmt_num(ownership['holders'])} | "
+            f"\u0633\u0647\u0645 \u06f1 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(ownership['top1_share'])} | "
+            f"\u0633\u0647\u0645 \u06f5 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(ownership['top5_share'])} | "
+            f"\u0633\u0647\u0645 \u06f1\u06f0 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(ownership['top10_share'])}"
+        )
+
+        self.ownership_summary_label.setText(
+            f"\u062a\u0639\u062f\u0627\u062f \u062f\u0627\u0631\u0646\u062f\u06af\u0627\u0646: {fmt_num(ownership['holders'])}\n"
+            f"\u06a9\u0644 \u062a\u0639\u062f\u0627\u062f \u0633\u0647\u0627\u0645 \u062f\u0631 \u0645\u0627\u0644\u06a9\u06cc\u062a: {fmt_num(ownership['total_closing_quantity'])}\n"
+            f"HHI \u0645\u0627\u0644\u06a9\u06cc\u062a: {fmt_num(ownership['hhi'])}\n"
+            f"\u0633\u0647\u0645 \u06f1 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(ownership['top1_share'])}\n"
+            f"\u0633\u0647\u0645 \u06f5 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(ownership['top5_share'])}\n"
+            f"\u0633\u0647\u0645 \u06f1\u06f0 \u0646\u0641\u0631 \u0627\u0648\u0644: {pct(ownership['top10_share'])}"
+        )
+
+
+
+class PersonsPage(QWidget):
+    """صفحه مشترک برای خریداران/فروشندگان برتر."""
+
+    def __init__(self, side: str, title: str):
+        super().__init__()
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.side = side
+        lay = QVBoxLayout(self)
+        t = QLabel(title)
+        t.setObjectName("pageTitle")
+        lay.addWidget(t)
+        self.search_box = make_search_box("جستجوی نام...")
+        self.search_box.textChanged.connect(self._filter)
+        lay.addWidget(self.search_box)
+        self.table = make_table(["نام", "نوع", "اطمینان شناسه", "حجم", "ارزش (ریال)",
+                                  "تعداد معاملات", "روزهای فعال", "اولین فعالیت", "آخرین فعالیت"])
+        lay.addWidget(self.table)
+
+    def refresh(self, conn, start, end):
+        persons = m.top_persons(conn, self.side, start, end, top_n=200)
+        rows = [[p["name"], p["type"], p["id_confidence"], p["quantity"], p["value"],
+                 p["n_transactions"], p["active_days"], jalali_date_display(p["first_seen"]), jalali_date_display(p["last_seen"])] for p in persons]
+        fill_table(self.table, rows, default_sort_col=4)  # ارزش (ریال)
+        self._filter(self.search_box.text())
+
+    def _filter(self, text):
+        apply_table_filter(self.table, text, column=0)
+
+
+class BrokersPage(QWidget):
+    def __init__(self):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        t = QLabel("کارگزاران")
+        t.setObjectName("pageTitle")
+        lay.addWidget(t)
+        self.search_box = make_search_box("جستجوی نام کارگزار...")
+        self.search_box.textChanged.connect(self._filter)
+        lay.addWidget(self.search_box)
+        self.tabs = QTabWidget()
+        self.buy_table = make_table(["نام کارگزار", "بازارگردان اصلی", "حجم", "ارزش (ریال)", "تعداد معاملات", "تعداد طرف مقابل"])
+        self.sell_table = make_table(["نام کارگزار", "بازارگردان اصلی", "حجم", "ارزش (ریال)", "تعداد معاملات", "تعداد طرف مقابل"])
+        self.tabs.addTab(self.buy_table, "کارگزاران خریدار")
+        self.tabs.addTab(self.sell_table, "کارگزاران فروشنده")
+        lay.addWidget(self.tabs)
+
+    def refresh(self, conn, start, end):
+        for side, table in [("buyer", self.buy_table), ("seller", self.sell_table)]:
+            brokers = m.top_brokers(conn, side, start, end, top_n=200)
+            rows = [[b["broker_name"], "بله" if b["is_primary_market_maker"] else "خیر", b["quantity"],
+                     b["value"], b["n_transactions"], b["n_counterparties"]] for b in brokers]
+            fill_table(table, rows, default_sort_col=3)  # ارزش (ریال)
+        self._filter(self.search_box.text())
+
+    def _filter(self, text):
+        apply_table_filter(self.buy_table, text, column=0)
+        apply_table_filter(self.sell_table, text, column=0)
+
+
+class BehaviorPage(QWidget):
+    """رفتار کوتاه‌مدت / نوسان‌گیری."""
+
+    def __init__(self):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        t = QLabel("الگوهای رفتاری کوتاه‌مدت (نوسان‌گیری)")
+        t.setObjectName("pageTitle")
+        lay.addWidget(t)
+        self.search_box = make_search_box("جستجوی نام...")
+        self.search_box.textChanged.connect(self._filter)
+        lay.addWidget(self.search_box)
+
+        self.tabs = QTabWidget()
+
+        score_tab = QWidget()
+        score_lay = QVBoxLayout(score_tab)
+        note = QLabel("این امتیاز شاخصی آماری از الگوی معاملات مشاهده‌شده است و اثبات‌کننده قصد یا استراتژی واقعی شخص نیست.")
+        note.setStyleSheet("color:#6B7280; font-size:11px;")
+        note.setAlignment(Qt.AlignRight)
+        score_lay.addWidget(note)
+        self.table = make_table(["نام", "امتیاز (۰-۱۰۰)", "سطح", "تعداد رفت‌وبرگشت", "روزهای فعال"])
+        score_lay.addWidget(self.table)
+        self.tabs.addTab(score_tab, "امتیاز کلی رفتار")
+
+        same_day_tab = QWidget()
+        same_day_lay = QVBoxLayout(same_day_tab)
+        note2 = QLabel(bh.DISCLAIMER_SAME_DAY)
+        note2.setWordWrap(True)
+        note2.setStyleSheet("color:#6B7280; font-size:11px;")
+        note2.setAlignment(Qt.AlignRight)
+        same_day_lay.addWidget(note2)
+        self.same_day_table = make_table(["نام", "تاریخ", "تعداد خرید", "نرخ خرید", "تعداد فروش", "نرخ فروش",
+                                           "هم‌پوشانی", "سود/زیان تقریبی (ریال)", "نوسان‌گیری؟"])
+        same_day_lay.addWidget(self.same_day_table)
+        self.tabs.addTab(same_day_tab, "خرید و فروش هم‌روز")
+
+        lay.addWidget(self.tabs)
+
+    def refresh(self, conn, start, end):
+        traders = bh.top_short_term_traders(conn, start, end, top_n=100)
+        rows = [[t["name"], t["score"], t["level"], t["n_round_trips"], t["active_days"]] for t in traders]
+        fill_table(self.table, rows, default_sort_col=1)  # امتیاز (۰-۱۰۰)
+
+        same_day = bh.same_day_buy_sell_pairs(conn, start, end, top_n=200)
+        sd_rows = [[p["name"], jalali_date_display(p["date"]), p["buy_qty"], p["buy_price"],
+                    p["sell_qty"], p["sell_price"], f"{p['overlap_ratio']:.0%}", p["approx_pnl"], p["verdict"]]
+                   for p in same_day]
+        fill_table(self.same_day_table, sd_rows)  # ترتیب طبیعی تابع (بر اساس بزرگی مواجهه هم‌روز) حفظ می‌شود
+        self._filter(self.search_box.text())
+
+    def _filter(self, text):
+        apply_table_filter(self.table, text, column=0)
+        apply_table_filter(self.same_day_table, text, column=0)
+
+
+class AnomaliesPage(QWidget):
+    def __init__(self):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        t = QLabel("هشدارهای معاملاتی (ناهنجاری‌ها)")
+        t.setObjectName("pageTitle")
+        lay.addWidget(t)
+        self.search_box = make_search_box("جستجو (نام کارگزار، نوع، تاریخ و ...)...")
+        self.search_box.textChanged.connect(self._filter)
+        lay.addWidget(self.search_box)
+        self.table = make_table(["نوع", "شدت", "امتیاز ریسک", "تاریخ", "ارزش (ریال)", "خریدار", "فروشنده", "توضیح"])
+        lay.addWidget(self.table)
+
+    def refresh(self, conn, start, end):
+        alerts = an.run_all_anomaly_detectors(conn, start, end)[:300]
+        rows = [[alert_type_fa(a["alert_type"]), severity_fa(a["severity"]), a["risk_score"], jalali_date_display(a.get("trade_date", "")),
+                 a.get("value", 0), a.get("buyer_name") or "—", a.get("seller_name") or "—", a["reason"]] for a in alerts]
+        fill_table(self.table, rows, default_sort_col=2)  # امتیاز ریسک
+        self._filter(self.search_box.text())
+
+    def _filter(self, text):
+        # نام کارگزار معمولاً فقط داخل متن «توضیح» می‌آید، نه یک ستون ثابت؛ پس همه ستون‌ها بررسی می‌شوند.
+        apply_table_filter(self.table, text, column=None)
+
+
+class MarketMakerPage(QWidget):
+    """رفتار بازارگردان: هم‌زمانی با روند قیمت (نه رابطه علّی)."""
+
+    def __init__(self):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        t = QLabel("رفتار بازارگردان")
+        t.setObjectName("pageTitle")
+        lay.addWidget(t)
+        self.narrative_label = QLabel("")
+        self.narrative_label.setWordWrap(True)
+        self.narrative_label.setAlignment(Qt.AlignRight)
+        lay.addWidget(self.narrative_label)
+        self.chart_view = QChartView()
+        self.chart_view.setMinimumHeight(280)
+        lay.addWidget(self.chart_view)
+        self.table = make_table(["تاریخ", "خرید بازارگردان (ریال)", "فروش بازارگردان (ریال)", "خالص (ریال)", "قیمت وزنی"])
+        lay.addWidget(self.table)
+
+    def refresh(self, conn, start, end):
+        summary = mm_mod.market_maker_summary(conn, start, end)
+        if not summary.get("has_market_maker"):
+            self.narrative_label.setText("بازارگردانی برای این نماد در این بازه شناسایی نشد.")
+            self.chart_view.setChart(QChart())
+            fill_table(self.table, [])
+            return
+
+        html_lines = "".join(f'<p dir="rtl" align="right">• {line}</p>' for line in summary["narrative"])
+        self.narrative_label.setText(html_lines)
+
+        daily = summary["daily"]
+        chart = QChart()
+        chart.setTitle("خالص خرید/فروش بازارگردان و روند قیمت")
+        bar_set_buy = QBarSet("خالص (ریال)")
+        categories = []
+        for d in daily:
+            bar_set_buy.append(d["mm_net_value"])
+            categories.append(jalali_date_display(d["date"])[5:])
+        series = QBarSeries()
+        series.append(bar_set_buy)
+        chart.addSeries(series)
+        line = QLineSeries()
+        line.setName("بیشترین قیمت روزانه")
+        for i, d in enumerate(daily):
+            line.append(i, d["price"])
+        chart.addSeries(line)
+
+        axis_x = QBarCategoryAxis()
+        step = max(1, len(categories) // 10)
+        axis_x.append([c if i % step == 0 else "" for i, c in enumerate(categories)])
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        series.attachAxis(axis_x)
+        line.attachAxis(axis_x)
+        axis_y = QValueAxis()
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        series.attachAxis(axis_y)
+        axis_y2 = QValueAxis()
+        chart.addAxis(axis_y2, Qt.AlignRight)
+        line.attachAxis(axis_y2)
+        self.chart_view.setChart(chart)
+
+        rows = [[jalali_date_display(d["date"]), d["mm_buy_value"], d["mm_sell_value"],
+                 d["mm_net_value"], d["price"]] for d in daily]
+        fill_table(self.table, rows, default_sort_col=0, descending=False)  # ترتیب زمانی
+
+
+class ComparisonPage(QWidget):
+    """مقایسه بازه انتخابی با بازه‌ی هم‌طول بلافاصله قبل از آن."""
+
+    def __init__(self):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        t = QLabel("مقایسه با بازه قبل")
+        t.setObjectName("pageTitle")
+        lay.addWidget(t)
+        self.period_label = QLabel("")
+        self.period_label.setAlignment(Qt.AlignRight)
+        lay.addWidget(self.period_label)
+        self.narrative_label = QLabel("")
+        self.narrative_label.setWordWrap(True)
+        self.narrative_label.setAlignment(Qt.AlignRight)
+        lay.addWidget(self.narrative_label)
+        self.table = make_table(["شاخص", "بازه قبل", "بازه فعلی", "درصد تغییر"])
+        self.table.setColumnWidth(0, 190)
+        self.table.setColumnWidth(1, 220)
+        self.table.setColumnWidth(2, 220)
+        self.table.setColumnWidth(3, 170)
+        lay.addWidget(self.table)
+        self.participants_label = QLabel("")
+        self.participants_label.setAlignment(Qt.AlignRight)
+        lay.addWidget(self.participants_label)
+
+    def refresh(self, conn, start, end):
+        res = comp.auto_compare_with_previous(conn, start, end, top_n=10)
+        if not res.get("deltas"):
+            self.period_label.setText("")
+            self.narrative_label.setText("داده‌ای برای مقایسه یافت نشد.")
+            fill_table(self.table, [])
+            self.participants_label.setText("")
+            return
+
+        self.period_label.setText(
+            f"بازه قبل: {res['period_a']['start_fa']} تا {res['period_a']['end_fa']}   |   "
+            f"بازه فعلی: {res['period_b']['start_fa']} تا {res['period_b']['end_fa']}"
+        )
+        html_lines = "".join(f'<p dir="rtl" align="right">• {line}</p>' for line in res["narrative"])
+        self.narrative_label.setText(html_lines)
+
+        label_fa = {"n_transactions": "تعداد معاملات", "total_value": "ارزش کل", "total_quantity": "حجم کل",
+                    "weighted_avg_price": "میانگین وزنی قیمت", "n_unique_buyers": "تعداد خریداران", "hhi_buyers": "HHI خریداران"}
+        rows = []
+        for key, d in res["deltas"].items():
+            pct_str = f"{d['pct']:+.1f}%" if d["pct"] is not None else "—"
+            rows.append([label_fa.get(key, key), d["a"], d["b"], pct_str])
+        fill_table(self.table, rows)
+        self.participants_label.setText(
+            f"خریداران تازه‌وارد: {res['n_new_participants']} نفر   |   خریداران خارج‌شده: {res['n_exited_participants']} نفر"
+        )
+
+
+class PortfolioPage(QWidget):
+    """رجیستری، تطبیق موجودی و محاسبات FIFO."""
+    def __init__(self):
+        super().__init__()
+        lay=QVBoxLayout(self)
+        t=QLabel("مالکیت، رجیستری و FIFO")
+        t.setObjectName("pageTitle")
+        lay.addWidget(t)
+        self.info=QLabel("")
+        self.info.setWordWrap(True)
+        self.info.setAlignment(Qt.AlignRight)
+        lay.addWidget(self.info)
+        self.search_box=make_search_box("جستجوی نام...")
+        self.search_box.textChanged.connect(self._filter)
+        lay.addWidget(self.search_box)
+        self.table=make_table([
+            "نام","اول دوره","خرید روزانه","فروش روزانه","پایان مورد انتظار",
+            "پایان رجیستری","اختلاف","سود تحقق‌یافته معلوم (ریال)",
+            "فروش با بهای نامعلوم","ورود احتمالی"
+        ])
+        lay.addWidget(self.table)
+
+    def refresh(self, conn, start, end):
+        try:
+            res=pf.run_fifo(conn)
+        except Exception as e:
+            self.info.setText(f"خطا در محاسبه FIFO: {e}")
+            fill_table(self.table,[])
+            return
+        sm=res["summary"]
+        self.info.setText(
+            f"<b>افراد تحلیل‌شده:</b> {fmt_num(sm['people'])}  |  "
+            f"<b>منطبق با رجیستری:</b> {fmt_num(sm['registry_matched'])}  |  "
+            f"<b>موارد بالقوه تازه‌وارد:</b> {fmt_num(sm['potential_new_entrants'])}  |  "
+            f"<b>تطبیق کامل پایان دوره:</b> {fmt_num(sm['reconciled'])}  |  "
+            f"<b>دارای اختلاف:</b> {fmt_num(sm['mismatched'])}<br>"
+            f"<span style='color:#6B7280'>بهای تمام‌شده موجودی اول دوره در فایل رجیستری ارائه نشده؛ "
+            f"بنابراین سود تحقق‌یافته فقط برای لات‌های دارای بهای معلوم عددی است. "
+            f"«ورود احتمالی» به‌دلیل امکان خطای تطبیق هویت، اثبات ورود قطعی نیست.</span>"
+        )
+        rows=[]
+        for r in sorted(res["results"],key=lambda x:abs(x["known_realized_pnl"]),reverse=True)[:500]:
+            rows.append([
+                r["name"] or "—", r["opening_qty"], r["daily_buy_qty"], r["daily_sell_qty"],
+                r["expected_closing_qty"], r["registry_closing_qty"] if r["registry_closing_qty"] is not None else "—",
+                r["reconciliation_diff"] if r["reconciliation_diff"] is not None else "—",
+                r["known_realized_pnl"], r["unknown_cost_sold_qty"],
+                "بله" if r["is_potential_new_entrant"] else "خیر"
+            ])
+        fill_table(self.table,rows,default_sort_col=7)
+        self._filter(self.search_box.text())
+
+    def _filter(self,text):
+        apply_table_filter(self.table,text,column=0)
+
+
+class DataQualityPage(QWidget):
+    def __init__(self):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        t = QLabel("کیفیت داده")
+        t.setObjectName("pageTitle")
+        lay.addWidget(t)
+        self.info_label = QLabel("ابتدا یک فایل اکسل وارد کنید.")
+        self.info_label.setAlignment(Qt.AlignRight)
+        self.info_label.setWordWrap(True)
+        lay.addWidget(self.info_label)
+        lay.addStretch()
+
+    def refresh(self, conn, start=None, end=None):
+        row = conn.execute("SELECT * FROM import_batches ORDER BY batch_id DESC LIMIT 1").fetchone()
+        if not row:
+            self.info_label.setText("هنوز داده‌ای وارد نشده است.")
+            return
+        cols = [d[0] for d in conn.execute("SELECT * FROM import_batches LIMIT 1").description]
+        d = dict(zip(cols, row))
+        n_dup = conn.execute("SELECT COUNT(*) FROM transactions WHERE is_duplicate_of IS NOT NULL").fetchone()[0]
+        text = (
+            f"<b>فایل منبع:</b> {d['source_file']}<br>"
+            f"<b>زمان Import:</b> {jalali_datetime_display(d['imported_at'])}<br>"
+            f"<b>سطرهای خام:</b> {fmt_num(d['n_rows_raw'])}<br>"
+            f"<b>سطرهای وارد شده:</b> {fmt_num(d['n_rows_imported'])}<br>"
+            f"<b>سطرهای رد شده:</b> {fmt_num(d['n_rows_rejected'])}<br>"
+            f"<b>معاملات تکراری شناسایی‌شده (دوبار ثبت):</b> {fmt_num(n_dup)}<br>"
+            f"<span style='color:{COLOR_GOOD}'>این معاملات تکراری از محاسبات تحلیلی کنار گذاشته شده‌اند تا اعداد دوبار شمرده نشوند.</span>"
+        )
+        self.info_label.setText(text)
+
+
+class ReportPage(QWidget):
+    def __init__(self, get_conn_and_range):
+        super().__init__()
+        self.get_conn_and_range = get_conn_and_range
+        lay = QVBoxLayout(self)
+        t = QLabel("گزارش هیئت‌مدیره")
+        t.setObjectName("pageTitle")
+        lay.addWidget(t)
+        desc = QLabel("گزارش کامل شامل خلاصه مدیریتی روایی، رفتار بازارگردان، مقایسه با بازه قبل، کارگزاران و اشخاص برتر، "
+                       "تمرکز معاملات (HHI)، رفتار کوتاه‌مدت، هشدارها، تحلیل بنیادی/کیفی/ارزش‌گذاری و محدودیت‌های داده.")
+        desc.setWordWrap(True)
+        desc.setAlignment(Qt.AlignRight)
+        lay.addWidget(desc)
+        btn_row = QHBoxLayout()
+        self.btn_excel = QPushButton("خروجی Excel")
+        self.btn_pdf = QPushButton("خروجی PDF")
+        self.btn_pptx = QPushButton("خروجی PowerPoint")
+        btn_row.addWidget(self.btn_pptx)
+        btn_row.addWidget(self.btn_pdf)
+        btn_row.addWidget(self.btn_excel)
+        lay.addLayout(btn_row)
+        self.status_label = QLabel("")
+        self.status_label.setAlignment(Qt.AlignRight)
+        lay.addWidget(self.status_label)
+        lay.addStretch()
+
+        self.btn_excel.clicked.connect(self.export_excel)
+        self.btn_pdf.clicked.connect(self.export_pdf)
+        self.btn_pptx.clicked.connect(self.export_pptx)
+
+    def export_excel(self):
+        conn, start, end = self.get_conn_and_range()
+        path, _ = QFileDialog.getSaveFileName(self, "ذخیره گزارش Excel", str(ROOT / "exports" / "gozaresh.xlsx"), "Excel (*.xlsx)")
+        if not path:
+            return
+        try:
+            generate_excel_report(conn, path, start, end)
+            self.status_label.setText(f"ذخیره شد: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "خطا", f"خطا در تولید گزارش:\n{e}")
+
+    def export_pdf(self):
+        conn, start, end = self.get_conn_and_range()
+        path, _ = QFileDialog.getSaveFileName(self, "ذخیره گزارش PDF", str(ROOT / "exports" / "gozaresh.pdf"), "PDF (*.pdf)")
+        if not path:
+            return
+        try:
+            generate_pdf_report(conn, path, start, end)
+            self.status_label.setText(f"ذخیره شد: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "خطا", f"خطا در تولید گزارش:\n{e}")
+
+    def export_pptx(self):
+        conn, start, end = self.get_conn_and_range()
+        path, _ = QFileDialog.getSaveFileName(self, "ذخیره ارائه PowerPoint", str(ROOT / "exports" / "gozaresh.pptx"), "PowerPoint (*.pptx)")
+        if not path:
+            return
+        try:
+            generate_pptx_report(conn, path, start, end)
+            self.status_label.setText(f"ذخیره شد: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "خطا", f"خطا در تولید ارائه:\n{e}")
+
+
+class _AIWorkerSignals(QObject):
+    finished = Signal(dict)
+    failed = Signal(str)
+
+
+class _AIWorker(QRunnable):
+    def __init__(self, db_path, start, end):
+        super().__init__()
+        self.db_path = db_path
+        self.start = start
+        self.end = end
+        self.signals = _AIWorkerSignals()
+
+    def run(self):
+        conn = None
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            result = generate_analysis(conn, self.start, self.end)
+            self.signals.finished.emit(result)
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
+class AIAssistantPage(QWidget):
+    """دستیار هوشمند با مسیر خودکار Local -> Local OpenAI-compatible -> Internet -> Built-in."""
+    def __init__(self, get_conn_and_range):
+        super().__init__()
+        self.get_conn_and_range = get_conn_and_range
+        self.pool = QThreadPool.globalInstance()
+        lay = QVBoxLayout(self)
+        title = QLabel("دستیار هوشمند تحلیل")
+        title.setObjectName("pageTitle")
+        lay.addWidget(title)
+        desc = QLabel(
+            "اولویت استفاده: Ollama محلی، سپس سرویس OpenAI-compatible محلی، سپس OpenAI از اینترنت در صورت وجود API Key؛ "
+            "در غیر این صورت تحلیل داخلی SmartEquity اجرا می‌شود. اطلاعات هویتی سهامداران در متن ارسالی به AI قرار نمی‌گیرد."
+        )
+        desc.setWordWrap(True)
+        desc.setAlignment(Qt.AlignRight)
+        lay.addWidget(desc)
+        self.provider_label = QLabel("آماده")
+        self.provider_label.setAlignment(Qt.AlignRight)
+        lay.addWidget(self.provider_label)
+        self.btn_run = QPushButton("اجرای تحلیل هوشمند")
+        self.btn_run.clicked.connect(self.run_analysis)
+        lay.addWidget(self.btn_run)
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setLayoutDirection(Qt.RightToLeft)
+        lay.addWidget(self.output)
+
+    def refresh(self, conn, start, end):
+        self.provider_label.setText("برای اجرای تحلیل، دکمه «اجرای تحلیل هوشمند» را بزنید.")
+
+    def run_analysis(self):
+        conn, start, end = self.get_conn_and_range()
+        if conn is None:
+            QMessageBox.warning(self, "داده موجود نیست", "ابتدا فایل رجیستری و فایل معاملات را Import کنید.")
+            return
+        self.btn_run.setEnabled(False)
+        self.provider_label.setText("در حال شناسایی سرویس AI...")
+        self.output.setPlainText("در حال تحلیل داده‌ها ...")
+        worker = _AIWorker(DB_PATH, start, end)
+        worker.signals.finished.connect(self._done)
+        worker.signals.failed.connect(self._failed)
+        self.pool.start(worker)
+
+    def _done(self, result):
+        self.btn_run.setEnabled(True)
+        self.provider_label.setText(f"سرویس استفاده‌شده: {result.get('provider', 'نامشخص')}")
+        self.output.setPlainText(result.get("text", ""))
+
+    def _failed(self, message):
+        self.btn_run.setEnabled(True)
+        self.provider_label.setText("خطا")
+        self.output.setPlainText(message)
+
+class SettingsPage(QWidget):
+    """
+    تنظیمات برنامه:
+    - اطلاعات گزارش‌ها
+    - لوگوی شرکت
+    - فونت تیتر و متن گزارش
+    - تنظیمات هوش مصنوعی
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        lay = QVBoxLayout(self)
+
+        title = QLabel("تنظیمات")
+        title.setObjectName("pageTitle")
+        lay.addWidget(title)
+
+        desc = QLabel(
+            "تنظیمات گزارش‌ها، اطلاعات شرکت، لوگو، فونت گزارش‌ها و اتصال "
+            "به سرویس‌های هوش مصنوعی."
+        )
+        desc.setWordWrap(True)
+        desc.setAlignment(Qt.AlignRight)
+        lay.addWidget(desc)
+
+        tabs = QTabWidget()
+        tabs.setLayoutDirection(Qt.RightToLeft)
+
+        # ================================================================
+        # تب اول: تنظیمات گزارش
+        # ================================================================
+        report_page = QWidget()
+        report_lay = QVBoxLayout(report_page)
+
+        report_title = QLabel("اطلاعات گزارش و شرکت")
+        report_title.setStyleSheet(
+            "font-weight:bold; font-size:15px;"
+        )
+        report_title.setAlignment(Qt.AlignRight)
+        report_lay.addWidget(report_title)
+
+        def add_report_field(label_text, placeholder=""):
+            lbl = QLabel(label_text)
+            lbl.setAlignment(Qt.AlignRight)
+
+            field = QLineEdit()
+            field.setPlaceholderText(placeholder)
+            field.setLayoutDirection(Qt.RightToLeft)
+
+            report_lay.addWidget(lbl)
+            report_lay.addWidget(field)
+
+            return field
+
+        self.company_name_edit = add_report_field(
+            "نام شرکت",
+            "مثلاً: شرکت گردشگری و رفاهی آبادگران ایران"
+        )
+
+        self.market_maker_edit = add_report_field(
+            "نام بازارگردان اصلی",
+            "نام دقیق کارگزار بازارگردان"
+        )
+
+        self.prepared_by_edit = add_report_field(
+            "تهیه‌کننده گزارش",
+            "مثلاً: مدیر مالی"
+        )
+
+        self.audience_edit = add_report_field(
+            "ارائه به",
+            "مثلاً: هیئت‌مدیره"
+        )
+
+        self.report_title_edit = add_report_field(
+            "عنوان گزارش",
+            "مثلاً: گزارش تحلیل معاملات سهام"
+        )
+
+        # ================================================================
+        # فونت‌های گزارش
+        # ================================================================
+        font_title = QLabel("فونت گزارش")
+        font_title.setAlignment(Qt.AlignRight)
+        font_title.setStyleSheet(
+            "font-weight:bold; font-size:14px; margin-top:10px;"
+        )
+        report_lay.addWidget(font_title)
+
+        font_description = QLabel(
+            "فونت‌ها از فهرست فونت‌های نصب‌شده در Windows خوانده می‌شوند. "
+            "این انتخاب در تنظیمات ذخیره می‌شود و در مرحله بعد برای "
+            "PDF، PowerPoint و Excel استفاده خواهد شد."
+        )
+        font_description.setWordWrap(True)
+        font_description.setAlignment(Qt.AlignRight)
+        font_description.setStyleSheet(
+            "color:#6B7280; font-size:11px;"
+        )
+        report_lay.addWidget(font_description)
+
+        # ------------------------------------------------
+        # فونت تیتر
+        # ------------------------------------------------
+        heading_font_label = QLabel("فونت تیتر گزارش")
+        heading_font_label.setAlignment(Qt.AlignRight)
+        report_lay.addWidget(heading_font_label)
+
+        self.heading_font_combo = QFontComboBox()
+        self.heading_font_combo.setEditable(True)
+        self.heading_font_combo.setInsertPolicy(
+            QFontComboBox.NoInsert
+        )
+        self.heading_font_combo.setLayoutDirection(
+            Qt.LeftToRight
+        )
+        self.heading_font_combo.setToolTip(
+            "فونت مورد استفاده برای تیترها و عناوین گزارش"
+        )
+        report_lay.addWidget(self.heading_font_combo)
+
+        # ------------------------------------------------
+        # فونت متن
+        # ------------------------------------------------
+        body_font_label = QLabel("فونت متن گزارش")
+        body_font_label.setAlignment(Qt.AlignRight)
+        report_lay.addWidget(body_font_label)
+
+        self.body_font_combo = QFontComboBox()
+        self.body_font_combo.setEditable(True)
+        self.body_font_combo.setInsertPolicy(
+            QFontComboBox.NoInsert
+        )
+        self.body_font_combo.setLayoutDirection(
+            Qt.LeftToRight
+        )
+        self.body_font_combo.setToolTip(
+            "فونت مورد استفاده برای متن اصلی گزارش"
+        )
+        report_lay.addWidget(self.body_font_combo)
+
+        # ------------------------------------------------
+        # بارگذاری تمام خانواده‌های فونت نصب‌شده Windows
+        # ------------------------------------------------
+        self._load_font_families()
+
+        # -------------------- لوگو --------------------
+        logo_title = QLabel("لوگوی شرکت")
+        logo_title.setAlignment(Qt.AlignRight)
+        logo_title.setStyleSheet("font-weight:bold;")
+        report_lay.addWidget(logo_title)
+
+        logo_row = QHBoxLayout()
+
+        self.logo_preview = QLabel("لوگویی انتخاب نشده")
+        self.logo_preview.setFixedSize(220, 90)
+        self.logo_preview.setAlignment(Qt.AlignCenter)
+        self.logo_preview.setStyleSheet(
+            "background:#F4F6F8; "
+            "border:1px solid #E2E8F0; "
+            "border-radius:6px; "
+            "color:#6B7280;"
+        )
+
+        logo_btn_col = QVBoxLayout()
+
+        self.btn_choose_logo = QPushButton("انتخاب لوگو...")
+        self.btn_choose_logo.setObjectName("secondary")
+        self.btn_choose_logo.clicked.connect(
+            self.on_choose_logo
+        )
+
+        self.btn_remove_logo = QPushButton("حذف لوگو")
+        self.btn_remove_logo.setObjectName("secondary")
+        self.btn_remove_logo.clicked.connect(
+            self.on_remove_logo
+        )
+
+        logo_btn_col.addWidget(self.btn_choose_logo)
+        logo_btn_col.addWidget(self.btn_remove_logo)
+        logo_btn_col.addStretch()
+
+        logo_row.addStretch()
+        logo_row.addLayout(logo_btn_col)
+        logo_row.addWidget(self.logo_preview)
+
+        report_lay.addLayout(logo_row)
+        report_lay.addStretch()
+
+        tabs.addTab(
+            report_page,
+            "گزارش‌ها و شرکت"
+        )
+
+        # ================================================================
+        # تب دوم: هوش مصنوعی
+        # ================================================================
+        ai_page = QWidget()
+        ai_lay = QVBoxLayout(ai_page)
+
+        ai_title = QLabel("تنظیمات هوش مصنوعی")
+        ai_title.setStyleSheet(
+            "font-weight:bold; font-size:15px;"
+        )
+        ai_title.setAlignment(Qt.AlignRight)
+        ai_lay.addWidget(ai_title)
+
+        ai_desc = QLabel(
+            "اولویت استفاده از هوش مصنوعی: "
+            "Ollama محلی ← سرویس Local OpenAI-Compatible ← "
+            "OpenAI اینترنتی ← موتور داخلی SmartEquity"
+        )
+        ai_desc.setWordWrap(True)
+        ai_desc.setAlignment(Qt.AlignRight)
+        ai_desc.setStyleSheet("color:#6B7280;")
+        ai_lay.addWidget(ai_desc)
+
+        def add_ai_field(
+            label_text,
+            placeholder="",
+            password=False
+        ):
+            field_box = QWidget()
+            field_lay = QVBoxLayout(field_box)
+
+            field_lay.setContentsMargins(0, 6, 0, 8)
+            field_lay.setSpacing(5)
+
+            lbl = QLabel(label_text)
+            lbl.setAlignment(Qt.AlignRight)
+            lbl.setMinimumHeight(24)
+
+            field = QLineEdit()
+            field.setPlaceholderText(placeholder)
+            field.setMinimumHeight(34)
+
+            if password:
+                field.setEchoMode(QLineEdit.Password)
+
+            field_lay.addWidget(lbl)
+            field_lay.addWidget(field)
+
+            ai_lay.addWidget(field_box)
+
+            return field
+
+        self.ollama_base_url_edit = add_ai_field(
+            "آدرس Ollama",
+            "مثلاً: http://127.0.0.1:11434"
+        )
+
+        self.ollama_model_edit = add_ai_field(
+            "مدل Ollama",
+            "مثلاً: qwen2.5-coder:7b"
+        )
+
+        ai_sep1 = QLabel(
+            "سرویس Local OpenAI-Compatible"
+        )
+        ai_sep1.setAlignment(Qt.AlignRight)
+        ai_sep1.setStyleSheet(
+            "font-weight:bold; margin-top:8px;"
+        )
+        ai_lay.addWidget(ai_sep1)
+
+        self.local_ai_base_url_edit = add_ai_field(
+            "آدرس سرویس محلی",
+            "مثلاً: http://127.0.0.1:20128/v1"
+        )
+
+        self.local_ai_model_edit = add_ai_field(
+            "نام مدل محلی",
+            "نام دقیق مدل"
+        )
+
+        self.local_ai_api_key_edit = add_ai_field(
+            "API Key سرویس محلی",
+            "در صورت نیاز",
+            password=True
+        )
+
+        ai_sep2 = QLabel(
+            "OpenAI اینترنتی"
+        )
+        ai_sep2.setAlignment(Qt.AlignRight)
+        ai_sep2.setStyleSheet(
+            "font-weight:bold; margin-top:8px;"
+        )
+        ai_lay.addWidget(ai_sep2)
+
+        self.openai_model_edit = add_ai_field(
+            "مدل OpenAI",
+            "مثلاً: gpt-5.6-luna"
+        )
+
+        self.openai_api_key_edit = add_ai_field(
+            "OpenAI API Key",
+            "در صورت استفاده از OpenAI",
+            password=True
+        )
+
+        ai_note = QLabel(
+            "نکته: اگر Ollama فعال باشد، برنامه ابتدا از "
+            "Ollama استفاده می‌کند. در صورت در دسترس نبودن آن، "
+            "گزینه‌های بعدی بررسی می‌شوند."
+        )
+        ai_note.setWordWrap(True)
+        ai_note.setAlignment(Qt.AlignRight)
+        ai_note.setStyleSheet(
+            "color:#6B7280; margin-top:8px;"
+        )
+        ai_lay.addWidget(ai_note)
+
+        ai_lay.addStretch()
+
+        tabs.addTab(
+            ai_page,
+            "هوش مصنوعی"
+        )
+
+        lay.addWidget(tabs)
+
+        # ================================================================
+        # دکمه ذخیره
+        # ================================================================
+        self.btn_save = QPushButton(
+            "ذخیره تنظیمات"
+        )
+        self.btn_save.clicked.connect(
+            self.on_save
+        )
+        lay.addWidget(self.btn_save)
+
+        self.status_label = QLabel("")
+        self.status_label.setAlignment(
+            Qt.AlignRight
+        )
+        self.status_label.setStyleSheet(
+            f"color:{COLOR_GOOD};"
+        )
+        lay.addWidget(self.status_label)
+
+        # ================================================================
+        # درباره نرم‌افزار
+        # ================================================================
+        about_box = QFrame()
+        about_box.setObjectName("kpiCard")
+
+        about_lay = QVBoxLayout(about_box)
+
+        about_title = QLabel(
+            "درباره این نرم‌افزار"
+        )
+        about_title.setStyleSheet(
+            "font-weight:bold;"
+        )
+        about_title.setAlignment(
+            Qt.AlignRight
+        )
+        about_lay.addWidget(
+            about_title
+        )
+
+        about_text = QLabel(
+            DEVELOPER_CREDIT_LINE
+        )
+        about_text.setAlignment(
+            Qt.AlignRight
+        )
+        about_text.setStyleSheet(
+            "color:#6B7280;"
+        )
+        about_lay.addWidget(
+            about_text
+        )
+
+        lay.addWidget(about_box)
+
+        self._load_current_values()
+
+    # ====================================================================
+    # فونت‌ها
+    # ====================================================================
+
+    def _load_font_families(self):
+        """
+        تمام خانواده فونت‌های نصب‌شده در Windows را
+        داخل هر دو QFontComboBox قرار می‌دهد.
+        """
+        families = installed_font_families()
+
+        if not families:
+            return
+
+        self.heading_font_combo.clear()
+        self.body_font_combo.clear()
+
+        self.heading_font_combo.addItems(
+            families
+        )
+        self.body_font_combo.addItems(
+            families
+        )
+
+    def _set_font_combo(
+        self,
+        combo: QFontComboBox,
+        font_name: str
+    ):
+        """
+        فونت ذخیره‌شده را در ComboBox انتخاب می‌کند.
+        اگر فونت در فهرست موجود نباشد، متن آن را حفظ می‌کند
+        تا تنظیمات قبلی بدون دلیل از بین نرود.
+        """
+        font_name = str(font_name or "").strip()
+
+        if not font_name:
+            return
+
+        index = combo.findText(
+            font_name,
+            Qt.MatchFixedString
+        )
+
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        else:
+            combo.setCurrentText(font_name)
+
+    # ====================================================================
+    # بارگذاری تنظیمات
+    # ====================================================================
+
+    def _load_current_values(self):
+        settings = load_settings()
+
+        # ------------------------------------------------
+        # تنظیمات گزارش
+        # ------------------------------------------------
+        self.company_name_edit.setText(
+            get_company_name()
+        )
+
+        self.market_maker_edit.setText(
+            "، ".join(
+                get_primary_market_maker_names()
+            )
+        )
+
+        self.prepared_by_edit.setText(
+            get_report_prepared_by()
+        )
+
+        self.audience_edit.setText(
+            get_report_audience()
+        )
+
+        self.report_title_edit.setText(
+            get_report_title()
+        )
+
+        # ------------------------------------------------
+        # فونت تیتر
+        # ------------------------------------------------
+        heading_font = settings.get(
+            "report_heading_font",
+            default_heading_font()
+        )
+
+        # ------------------------------------------------
+        # فونت متن
+        # ------------------------------------------------
+        body_font = settings.get(
+            "report_body_font",
+            default_body_font()
+        )
+
+        self._set_font_combo(
+            self.heading_font_combo,
+            heading_font
+        )
+
+        self._set_font_combo(
+            self.body_font_combo,
+            body_font
+        )
+
+        # ------------------------------------------------
+        # تنظیمات AI
+        # ------------------------------------------------
+        self.ollama_base_url_edit.setText(
+            settings.get(
+                "ollama_base_url",
+                ""
+            )
+        )
+
+        self.ollama_model_edit.setText(
+            settings.get(
+                "ollama_model",
+                ""
+            )
+        )
+
+        self.local_ai_base_url_edit.setText(
+            settings.get(
+                "local_ai_base_url",
+                ""
+            )
+        )
+
+        self.local_ai_model_edit.setText(
+            settings.get(
+                "local_ai_model",
+                ""
+            )
+        )
+
+        self.local_ai_api_key_edit.setText(
+            settings.get(
+                "local_ai_api_key",
+                ""
+            )
+        )
+
+        self.openai_model_edit.setText(
+            settings.get(
+                "openai_model",
+                ""
+            )
+        )
+
+        self.openai_api_key_edit.setText(
+            settings.get(
+                "openai_api_key",
+                ""
+            )
+        )
+
+        self._load_logo_preview()
+
+    # ====================================================================
+    # لوگو
+    # ====================================================================
+
+    def _load_logo_preview(self):
+        logo_path = get_logo_path()
+
+        if logo_path:
+            pixmap = QPixmap(
+                str(logo_path)
+            )
+
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(
+                    210,
+                    80,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+
+                self.logo_preview.setPixmap(
+                    scaled
+                )
+
+                self.btn_remove_logo.setEnabled(
+                    True
+                )
+
+                return
+
+        self.logo_preview.setPixmap(
+            QPixmap()
+        )
+        self.logo_preview.setText(
+            "لوگویی انتخاب نشده"
+        )
+        self.btn_remove_logo.setEnabled(
+            False
+        )
+
+    def on_choose_logo(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "انتخاب لوگو",
+            str(pathlib.Path.home()),
+            "تصاویر (*.png *.jpg *.jpeg *.bmp)"
+        )
+
+        if not path:
+            return
+
+        try:
+            set_logo(path)
+
+            self._load_logo_preview()
+
+            self.status_label.setText(
+                "لوگو ذخیره شد."
+            )
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "خطا",
+                f"خطا در بارگذاری لوگو:\n{e}"
+            )
+
+    def on_remove_logo(self):
+        remove_logo()
+
+        self._load_logo_preview()
+
+        self.status_label.setText(
+            "لوگو حذف شد."
+        )
+
+    # ====================================================================
+    # ذخیره تنظیمات
+    # ====================================================================
+
+    def on_save(self):
+        mm_names = [
+            n.strip()
+            for n in self.market_maker_edit.text().split("،")
+            if n.strip()
+        ]
+
+        if not mm_names:
+            mm_names = [
+                n.strip()
+                for n in self.market_maker_edit.text().split(",")
+                if n.strip()
+            ]
+
+        save_settings({
+            # ------------------------------------------------
+            # گزارش
+            # ------------------------------------------------
+            "company_name":
+                self.company_name_edit.text().strip(),
+
+            "primary_market_maker_broker_names":
+                mm_names,
+
+            "report_prepared_by":
+                self.prepared_by_edit.text().strip(),
+
+            "report_audience":
+                self.audience_edit.text().strip(),
+
+            "report_title":
+                self.report_title_edit.text().strip(),
+
+            # ------------------------------------------------
+            # فونت گزارش
+            # ------------------------------------------------
+            "report_heading_font":
+                self.heading_font_combo.currentText().strip(),
+
+            "report_body_font":
+                self.body_font_combo.currentText().strip(),
+
+            # ------------------------------------------------
+            # هوش مصنوعی
+            # ------------------------------------------------
+            "ollama_base_url":
+                self.ollama_base_url_edit.text().strip(),
+
+            "ollama_model":
+                self.ollama_model_edit.text().strip(),
+
+            "local_ai_base_url":
+                self.local_ai_base_url_edit.text().strip(),
+
+            "local_ai_model":
+                self.local_ai_model_edit.text().strip(),
+
+            "local_ai_api_key":
+                self.local_ai_api_key_edit.text(),
+
+            "openai_model":
+                self.openai_model_edit.text().strip(),
+
+            "openai_api_key":
+                self.openai_api_key_edit.text(),
+        })
+
+        self.status_label.setText(
+            "تنظیمات با موفقیت ذخیره شد."
+        )
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setWindowTitle("سامانه هوشمند تحلیل معاملات سهام — Smart Equity Transaction Intelligence")
+        self.resize(1180, 760)
+        self.conn: sqlite3.Connection | None = None
+        if DB_PATH.exists():
+            candidate_conn = sqlite3.connect(str(DB_PATH))
+            try:
+                tables = {
+                    row[0]
+                    for row in candidate_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                required_tables = {"transactions", "registry_holdings"}
+
+                if required_tables.issubset(tables):
+                    self.conn = candidate_conn
+                else:
+                    candidate_conn.close()
+            except sqlite3.Error:
+                candidate_conn.close()
+
+        central = QWidget()
+        central.setObjectName("centralWidget")
+        self.setCentralWidget(central)
+        outer = QVBoxLayout(central)
+
+        # --- top bar: import + filter ---
+        top_bar = QHBoxLayout()
+        self.btn_import = QPushButton("Import معاملات")
+        self.btn_import.clicked.connect(self.on_import_clicked)
+        top_bar.addWidget(self.btn_import)
+
+        self.btn_import_registry = QPushButton("Import رجیستری")
+        self.btn_import_registry.setObjectName("secondary")
+        self.btn_import_registry.clicked.connect(self.on_import_registry_clicked)
+        top_bar.addWidget(self.btn_import_registry)
+        self.btn_import_project = QPushButton("پروژه جدید: رجیستری + معاملات")
+        self.btn_import_project.setObjectName("secondary")
+        self.btn_import_project.clicked.connect(self.on_import_project_clicked)
+        top_bar.addWidget(self.btn_import_project)
+
+        top_bar.addWidget(QLabel("از تاریخ (شمسی):"))
+        self.start_edit = QLineEdit()
+        self.start_edit.setPlaceholderText("1405/03/01")
+        top_bar.addWidget(self.start_edit)
+
+        top_bar.addWidget(QLabel("تا تاریخ (شمسی):"))
+        self.end_edit = QLineEdit()
+        self.end_edit.setPlaceholderText("1405/05/27")
+        top_bar.addWidget(self.end_edit)
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(["کل بازه", "۷ روز اخیر", "۳۰ روز اخیر", "سفارشی"])
+        self.preset_combo.currentIndexChanged.connect(self.on_preset_changed)
+        top_bar.addWidget(self.preset_combo)
+
+        self.btn_apply = QPushButton("اعمال فیلتر")
+        self.btn_apply.setObjectName("secondary")
+        self.btn_apply.clicked.connect(self.refresh_current_page)
+        top_bar.addWidget(self.btn_apply)
+        top_bar.addStretch()
+        outer.addLayout(top_bar)
+
+        # --- body: sidebar + pages ---
+        body = QHBoxLayout()
+        outer.addLayout(body)
+
+        self.sidebar = QListWidget()
+        self.sidebar.setObjectName("sidebar")
+        self.sidebar.setFixedWidth(220)
+        self.page_names = [
+            "داشبورد",
+            "مقایسه با بازه قبل",
+            "بازارگردان",
+            "خریداران برتر",
+            "فروشندگان برتر",
+            "کارگزاران",
+            "رفتار کوتاه‌مدت",
+            "هشدارها",
+            "کیفیت داده",
+            "مالکیت و FIFO",
+            "گزارش هیئت‌مدیره",
+            "دستیار هوشمند تحلیل",
+            "تنظیمات اولیه",
+        ]
+        for name in self.page_names:
+            QListWidgetItem(name, self.sidebar)
+        body.addWidget(self.sidebar)
+
+        self.stack = QStackedWidget()
+        self.dashboard_page = DashboardPage()
+        self.comparison_page = ComparisonPage()
+        self.market_maker_page = MarketMakerPage()
+        self.buyers_page = PersonsPage("buyer", "خریداران برتر")
+        self.sellers_page = PersonsPage("seller", "فروشندگان برتر")
+        self.brokers_page = BrokersPage()
+        self.behavior_page = BehaviorPage()
+        self.anomalies_page = AnomaliesPage()
+        self.dq_page = DataQualityPage()
+        self.portfolio_page = PortfolioPage()
+        self.report_page = ReportPage(self.get_conn_and_range)
+        self.ai_page = AIAssistantPage(self.get_conn_and_range)
+        self.settings_page = SettingsPage()
+        for p in [self.dashboard_page, self.comparison_page, self.market_maker_page, self.buyers_page,
+                  self.sellers_page, self.brokers_page, self.behavior_page, self.anomalies_page,
+                  self.dq_page, self.portfolio_page, self.report_page, self.ai_page, self.settings_page]:
+            self.stack.addWidget(p)
+        body.addWidget(self.stack)
+
+        self.sidebar.currentRowChanged.connect(self.on_page_changed)
+        self.sidebar.setCurrentRow(0)
+
+        if self.conn:
+            self.refresh_all_pages()
+        else:
+            # در اولین اجرای پروژه، رجیستری باید به‌عنوان مبنای مالکیت از کاربر دریافت شود.
+            QTimer.singleShot(350, self.prompt_initial_project)
+
+    def prompt_initial_project(self):
+        """اولین اجرای برنامه: دریافت رجیستری و سپس فایل معاملات روزانه."""
+        answer = QMessageBox.question(
+            self,
+            "شروع پروژه",
+            "برای شروع، ابتدا فایل رجیستری سهامداران را انتخاب کنید و سپس فایل خرید و فروش روزانه را.\n\n"
+            "رجیستری مبنای اطلاعات اولیه مالکیت و FIFO خواهد بود.",
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Ok,
+        )
+        if answer == QMessageBox.Ok:
+            self.on_import_project_clicked()
+
+    def get_conn_and_range(self):
+        start = jalali_to_greg_str(self.start_edit.text())
+        end = jalali_to_greg_str(self.end_edit.text())
+        return self.conn, start, end
+
+    def on_preset_changed(self, idx):
+        if not self.conn:
+            return
+        row = self.conn.execute("SELECT MAX(trade_date_gregorian) FROM transactions").fetchone()
+        last_date_str = row[0] if row and row[0] else None
+        if last_date_str is None:
+            return
+        last_date = dt.date.fromisoformat(last_date_str)
+        label = self.preset_combo.currentText()
+        if label == "کل بازه":
+            self.start_edit.clear()
+            self.end_edit.clear()
+        elif label == "۷ روز اخیر":
+            start = last_date - dt.timedelta(days=7)
+            self.start_edit.setText(to_jalali_str(start))
+            self.end_edit.setText(to_jalali_str(last_date))
+        elif label == "۳۰ روز اخیر":
+            start = last_date - dt.timedelta(days=30)
+            self.start_edit.setText(to_jalali_str(start))
+            self.end_edit.setText(to_jalali_str(last_date))
+        self.refresh_current_page()
+
+    def on_page_changed(self, idx):
+        self.stack.setCurrentIndex(idx)
+        self.refresh_current_page()
+
+    def refresh_current_page(self):
+        if not self.conn:
+            return
+        start = jalali_to_greg_str(self.start_edit.text())
+        end = jalali_to_greg_str(self.end_edit.text())
+        page = self.stack.currentWidget()
+        if hasattr(page, "refresh"):
+            page.refresh(self.conn, start, end)
+
+    def refresh_all_pages(self):
+        start = jalali_to_greg_str(self.start_edit.text())
+        end = jalali_to_greg_str(self.end_edit.text())
+        for p in [self.dashboard_page, self.comparison_page, self.market_maker_page, self.buyers_page,
+                  self.sellers_page, self.brokers_page, self.behavior_page, self.anomalies_page, self.dq_page, self.portfolio_page]:
+            p.refresh(self.conn, start, end)
+
+    def _rebuild_derived_state(self):
+        """پس از Import مستقل، فقط در صورت وجود هر دو دیتاست، هویت و FIFO را بازسازی می‌کند."""
+        if not self.conn:
+            return {"identity": None, "fifo": None}
+
+        registry_count = self.conn.execute(
+            "SELECT COUNT(*) FROM registry_holdings"
+        ).fetchone()[0]
+
+        transaction_count = self.conn.execute(
+            "SELECT COUNT(*) FROM transactions"
+        ).fetchone()[0]
+
+        identity = None
+        fifo = None
+
+        if registry_count > 0:
+            identity = reconcile_identities(self.conn)
+
+        if registry_count > 0 and transaction_count > 0:
+            fifo_result = pf.run_fifo(self.conn)
+            fifo = fifo_result["summary"]
+
+        return {
+            "identity": identity,
+            "fifo": fifo,
+        }
+
+    def on_import_clicked(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "انتخاب فایل خرید و فروش روزانه",
+            str(pathlib.Path.home()),
+            "Excel (*.xlsx)"
+        )
+        if not path:
+            return
+
+        try:
+            if self.conn:
+                self.conn.commit()
+                self.conn.close()
+                self.conn = None
+
+            DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+            # فقط معاملات جایگزین می‌شوند؛ رجیستری سهامداران حفظ می‌شود.
+            result = import_excel(
+                path,
+                str(DB_PATH),
+                reset_db=False
+            )
+
+            self.conn = sqlite3.connect(str(DB_PATH))
+            derived = self._rebuild_derived_state()
+
+            self.refresh_all_pages()
+
+            identity = derived["identity"]
+            fifo = derived["fifo"]
+
+            if identity is None:
+                registry_status = (
+                    "رجیستری سهامداران هنوز وارد نشده است."
+                )
+            else:
+                registry_status = (
+                    f"تطبیق هویت: {identity['matched']:,} نفر "
+                    f"از {identity['total_people']:,}"
+                )
+
+            if fifo is None:
+                fifo_status = (
+                    "FIFO هنوز اجرا نشده است؛ برای اجرای FIFO "
+                    "باید رجیستری و معاملات هر دو موجود باشند."
+                )
+            else:
+                fifo_status = (
+                    f"تعداد افراد تحلیل‌شده در FIFO: {fifo['people']:,}"
+                )
+
+            QMessageBox.information(
+                self,
+                "Import معاملات موفق",
+                f"سطرهای وارد شده: {result['n_rows_imported']:,}\n"
+                f"سطرهای رد شده: {result['n_rows_rejected']:,}\n"
+                f"سطرهای تکراری شناسایی‌شده: "
+                f"{result['n_rows_duplicate_flagged']:,}\n\n"
+                f"{registry_status}\n"
+                f"{fifo_status}"
+            )
+
+        except Exception as e:
+            if self.conn is None and DB_PATH.exists():
+                try:
+                    self.conn = sqlite3.connect(str(DB_PATH))
+                except Exception:
+                    pass
+            QMessageBox.critical(
+                self,
+                "خطا در Import معاملات",
+                str(e)
+            )
+
+    def on_import_registry_clicked(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "انتخاب فایل رجیستری سهامداران",
+            str(pathlib.Path.home()),
+            "Excel (*.xlsx)"
+        )
+        if not path:
+            return
+
+        try:
+            if self.conn:
+                self.conn.commit()
+                self.conn.close()
+                self.conn = None
+
+            DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+            # اگر دیتابیس وجود نداشته باشد، فقط Schema ساخته می‌شود.
+            conn = init_db(str(DB_PATH))
+            conn.close()
+
+            # فقط رجیستری جایگزین می‌شود؛ معاملات حفظ می‌شوند.
+            registry_result = import_registry(
+                path,
+                str(DB_PATH),
+                reset_registry=True
+            )
+
+            self.conn = sqlite3.connect(str(DB_PATH))
+            derived = self._rebuild_derived_state()
+
+            self.refresh_all_pages()
+
+            identity = derived["identity"]
+            fifo = derived["fifo"]
+
+            if identity is None:
+                identity_status = (
+                    "تطبیق هویت هنوز اجرا نشده است؛ داده‌ای برای تطبیق وجود ندارد."
+                )
+            else:
+                identity_status = (
+                    f"تطبیق هویت: {identity['matched']:,} نفر "
+                    f"از {identity['total_people']:,}"
+                )
+
+            if fifo is None:
+                fifo_status = (
+                    "FIFO هنوز اجرا نشده است؛ برای اجرای FIFO "
+                    "باید معاملات نیز وارد شده باشند."
+                )
+            else:
+                fifo_status = (
+                    f"تعداد افراد تحلیل‌شده در FIFO: {fifo['people']:,}"
+                )
+
+            QMessageBox.information(
+                self,
+                "Import رجیستری موفق",
+                f"سهامداران وارد شده: "
+                f"{registry_result['n_rows_imported']:,}\n"
+                f"سطرهای رد شده: "
+                f"{registry_result['n_rows_rejected']:,}\n"
+                f"مجموع سهام اول دوره: "
+                f"{registry_result['total_opening_quantity']:,}\n"
+                f"مجموع سهام پایان دوره: "
+                f"{registry_result['total_closing_quantity']:,}\n\n"
+                f"{identity_status}\n"
+                f"{fifo_status}"
+            )
+
+        except Exception as e:
+            if self.conn is None and DB_PATH.exists():
+                try:
+                    self.conn = sqlite3.connect(str(DB_PATH))
+                except Exception:
+                    pass
+            QMessageBox.critical(
+                self,
+                "خطا در Import رجیستری",
+                str(e)
+            )
+
+    def on_import_project_clicked(self):
+        # طبق نیاز پروژه: ابتدا رجیستری، سپس معاملات روزانه درخواست می‌شود.
+        reg_path, _ = QFileDialog.getOpenFileName(
+            self, "انتخاب فایل رجیستری سهامداران (اطلاعات اولیه)", str(pathlib.Path.home()), "Excel (*.xlsx)"
+        )
+        if not reg_path:
+            return
+        tx_path, _ = QFileDialog.getOpenFileName(
+            self, "انتخاب فایل خرید و فروش روزانه", str(pathlib.Path.home()), "Excel (*.xlsx)"
+        )
+        if not tx_path:
+            return
+        try:
+            if self.conn:
+                self.conn.close()
+                self.conn = None
+            DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            result = import_project(tx_path, reg_path, str(DB_PATH))
+            self.conn = sqlite3.connect(str(DB_PATH))
+            self.refresh_all_pages()
+            f = result["fifo"]
+            QMessageBox.information(
+                self,
+                "Import پروژه موفق",
+                f"رجیستری: {result['registry']['n_rows_imported']:,} سهامدار\n"
+                f"معاملات: {result['transactions']['n_rows_imported']:,} سطر\n"
+                f"تطبیق هویت: {result['identity']['matched']:,} نفر از {result['identity']['total_people']:,}\n"
+                f"تطبیق کامل پایان دوره: {f['reconciled']:,}\n"
+                f"موارد دارای اختلاف: {f['mismatched']:,}\n"
+                f"ورود احتمالی: {f['potential_new_entrants']:,}\n\n"
+                "فایل‌ها در همین پروژه ثبت شده‌اند و با بستن برنامه حذف نمی‌شوند. برای شروع تحلیل شرکت/نماد جدید، همین گزینه را دوباره اجرا کنید."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "خطا در Import پروژه", str(e))
+
+    def _delete_imported_data(self):
+        """داده‌های واردشده را حذف می‌کند ولی Schema، تنظیمات و لوگو را حفظ می‌کند."""
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        conn = sqlite3.connect(str(DB_PATH))
+
+        # ابتدا جداول وابسته و محاسباتی، سپس جداول اصلی داده.
+        tables = [
+            "fifo_realizations",
+            "fifo_lots",
+            "identity_matches",
+            "transactions",
+            "data_quality",
+            "alerts",
+            "analysis_cache",
+            "portfolio_analysis_cache",
+            "persons",
+            "brokers",
+            "symbols",
+            "import_batches",
+            "registry_holdings",
+            "registry_batches",
+        ]
+
+        try:
+            for table in tables:
+                conn.execute(f"DELETE FROM {table}")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def closeEvent(self, event):
+        """هنگام خروج، کاربر انتخاب می‌کند داده‌ها حفظ یا حذف شوند."""
+        if not self.conn:
+            event.accept()
+            return
+
+        box = QMessageBox(self)
+        box.setWindowTitle("خروج از Smart Equity")
+        box.setText("با داده‌های واردشده چه کاری انجام شود؟")
+        box.setInformativeText(
+            "تنظیمات برنامه و لوگو در هر دو حالت حفظ می‌شوند."
+        )
+        box.setIcon(QMessageBox.Question)
+
+        btn_delete = box.addButton(
+            "حذف داده‌ها و خروج",
+            QMessageBox.DestructiveRole
+        )
+        btn_keep = box.addButton(
+            "حفظ داده‌ها و خروج",
+            QMessageBox.AcceptRole
+        )
+        btn_cancel = box.addButton(
+            "انصراف",
+            QMessageBox.RejectRole
+        )
+
+        box.exec()
+
+        clicked = box.clickedButton()
+
+        if clicked == btn_cancel:
+            event.ignore()
+            return
+
+        try:
+            self.conn.commit()
+            self.conn.close()
+            self.conn = None
+
+            if clicked == btn_delete:
+                self._delete_imported_data()
+
+            event.accept()
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "خطا هنگام خروج",
+                f"عملیات خروج با خطا مواجه شد:\n{e}"
+            )
+            event.ignore()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyleSheet(APP_STYLESHEET)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+
+
+
+
+
+
+
+
+
+
+

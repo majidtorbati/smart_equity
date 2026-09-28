@@ -1,0 +1,520 @@
+﻿"""
+PDF Executive Report — گزارش حرفه‌ای هیئت‌مدیره.
+شامل: خلاصه مدیریتی روایی، نمودار قیمت، تحلیل بازارگردان، مقایسه با بازه قبل،
+جداول کارگزاران/اشخاص برتر، تمرکز، رفتار کوتاه‌مدت، هشدارها، روش‌شناسی و محدودیت‌های داده.
+همه تاریخ‌ها شمسی نمایش داده می‌شوند (ذخیره‌سازی داخلی همچنان میلادی است).
+"""
+from __future__ import annotations
+import sqlite3
+import sys
+import pathlib
+import datetime as dt
+import tempfile
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+from app.analytics import metrics as m
+from app.analytics import market_maker as mm_mod
+from app.analytics import comparison as comp
+from app.analytics import insights as ins
+from app.analytics import extended_analysis as ext
+from app.analytics import portfolio as pf
+from app.detection import anomaly as an
+from app.detection import behavior as bh
+from app.core.labels import alert_type_fa, severity_fa, concentration_level_fa
+from app.core.jalali import jalali_date_display, gregorian_to_jalali
+from app.core.normalize import clean_display
+from app.core.farsi_text import fa
+from app.core.runtime import resource_root
+from app.reports import charts as ch
+from app.config.settings import (get_company_name, get_report_prepared_by, get_report_audience,
+                                  get_report_title, get_logo_path, DEVELOPER_CREDIT_LINE)
+
+ASSETS_DIR = resource_root() / "assets"
+FONT_REGULAR = str(ASSETS_DIR / "BNazanin.ttf")
+FONT_BOLD = str(ASSETS_DIR / "BTitrBd.ttf")
+
+pdfmetrics.registerFont(TTFont("BNazanin", FONT_REGULAR))
+pdfmetrics.registerFont(TTFont("BTitr", FONT_BOLD))
+
+COLOR_PRIMARY = colors.HexColor("#1F4E78")
+COLOR_MUTED = colors.HexColor("#6B7280")
+
+
+class RTLReport:
+    def __init__(self, path, page_size=A4):
+        self.path = path
+        self.page_w, self.page_h = page_size
+        self.c = canvas.Canvas(path, pagesize=page_size)
+        self.margin = 18 * mm
+        self.y = self.page_h - self.margin
+        self.line_height = 6.5 * mm
+        self._cur_font = ("BNazanin", 10)
+        self._tmp_files = []
+
+    def _set_font(self, name, size):
+        self._cur_font = (name, size)
+        self.c.setFont(name, size)
+
+    def _draw_footer(self):
+        page_num = self.c.getPageNumber()
+        prev_font = self._cur_font
+        self.c.setFont("BNazanin", 8)
+        self.c.setFillColor(COLOR_MUTED)
+        self.c.drawCentredString(self.page_w / 2, 10 * mm, fa(f"صفحه {page_num}"))
+        self.c.drawString(self.margin, 10 * mm, "Smart Equity Transaction Intelligence")
+        self.c.setFillColor(colors.black)
+        self.c.setFont(*prev_font)
+
+    def _new_page(self):
+        self._draw_footer()
+        self.c.showPage()
+        self.y = self.page_h - self.margin
+        self.c.setFont(*self._cur_font)
+        self.c.setFillColor(colors.black)
+
+    def _check_page_break(self, needed=1):
+        if self.y - needed * self.line_height < self.margin + 8 * mm:
+            self._new_page()
+
+    def _ensure_space_mm(self, height_mm_val):
+        if self.y - height_mm_val * mm < self.margin + 8 * mm:
+            self._new_page()
+
+    def title(self, text, size=17):
+        self._check_page_break(2)
+        self._set_font("BTitr", size)
+        self.c.setFillColor(COLOR_PRIMARY)
+        self.c.drawRightString(self.page_w - self.margin, self.y, fa(text))
+        self.c.setFillColor(colors.black)
+        self.y -= size / 2 * mm + 5 * mm
+
+    def heading(self, text, size=13):
+        self._check_page_break(3)
+        self.y -= 2 * mm
+        self._set_font("BTitr", size)
+        self.c.setFillColor(COLOR_PRIMARY)
+        self.c.drawRightString(self.page_w - self.margin, self.y, fa(text))
+        self.c.setLineWidth(0.6)
+        self.c.setStrokeColor(COLOR_PRIMARY)
+        self.c.line(self.margin, self.y - 2 * mm, self.page_w - self.margin, self.y - 2 * mm)
+        self.c.setFillColor(colors.black)
+        self.y -= self.line_height + 2 * mm
+
+    def sub_heading(self, text, size=10.5):
+        self._check_page_break(2)
+        self._set_font("BTitr", size)
+        self.c.setFillColor(colors.HexColor("#374151"))
+        self.c.drawRightString(self.page_w - self.margin, self.y, fa(text))
+        self.c.setFillColor(colors.black)
+        self.y -= self.line_height
+
+    def paragraph(self, text, size=10):
+        self._check_page_break(1)
+        self._set_font("BNazanin", size)
+        self.c.drawRightString(self.page_w - self.margin, self.y, fa(text))
+        self.y -= self.line_height
+
+    def wrapped_paragraph(self, text, size=10, bold=False, color=None, bullet=False):
+        """پاراگراف روایی چندخطی با شکست خط خودکار (اندازه‌گیری روی متن shape-شده)."""
+        font_name = "BTitr" if bold else "BNazanin"
+        prefix = "• " if bullet else ""
+        text = prefix + text
+        self._set_font(font_name, size)
+        max_width = self.page_w - 2 * self.margin
+        words = text.split(" ")
+        lines, line_words = [], []
+        for w in words:
+            candidate = line_words + [w]
+            width = self.c.stringWidth(fa(" ".join(candidate)), font_name, size)
+            if width <= max_width or not line_words:
+                line_words = candidate
+            else:
+                lines.append(" ".join(line_words))
+                line_words = [w]
+        if line_words:
+            lines.append(" ".join(line_words))
+        for line in lines:
+            self._check_page_break(1)
+            self._set_font(font_name, size)
+            if color:
+                self.c.setFillColor(color)
+            self.c.drawRightString(self.page_w - self.margin, self.y, fa(line))
+            if color:
+                self.c.setFillColor(colors.black)
+            self.y -= self.line_height
+
+    def kv_row(self, label, value, size=10):
+        self._check_page_break(1)
+        self._set_font("BNazanin", size)
+        self.c.drawRightString(self.page_w - self.margin, self.y, fa(f"{label}: {value}"))
+        self.y -= self.line_height
+
+    def table(self, headers: list[str], rows: list[list], col_widths=None, size=9):
+        n_cols = len(headers)
+        if col_widths is None:
+            usable = self.page_w - 2 * self.margin
+            col_widths = [usable / n_cols] * n_cols
+        self._check_page_break(2)
+        self._set_font("BTitr", size)
+        self.c.setFillColor(COLOR_PRIMARY)
+        self.c.rect(self.margin, self.y - 2 * mm, self.page_w - 2 * self.margin, self.line_height, fill=1, stroke=0)
+        self.c.setFillColor(colors.white)
+        cx = self.page_w - self.margin
+        for h, w in zip(headers, col_widths):
+            self.c.drawRightString(cx - 2, self.y, fa(h))
+            cx -= w
+        self.c.setFillColor(colors.black)
+        self.y -= self.line_height + 1 * mm
+        self._set_font("BNazanin", size)
+        for i, row in enumerate(rows):
+            self._check_page_break(1)
+            if i % 2 == 1:
+                self.c.setFillColor(colors.HexColor("#F4F6F8"))
+                self.c.rect(self.margin, self.y - 1.5 * mm, self.page_w - 2 * self.margin, self.line_height, fill=1, stroke=0)
+                self.c.setFillColor(colors.black)
+            cx = self.page_w - self.margin
+            for val, w in zip(row, col_widths):
+                self.c.drawRightString(cx - 2, self.y, fa(val))
+                cx -= w
+            self.y -= self.line_height
+
+    def image(self, path, width_mm=170, height_mm=62):
+        self._ensure_space_mm(height_mm + 4)
+        x = (self.page_w - width_mm * mm) / 2
+        y = self.y - height_mm * mm
+        self.c.drawImage(path, x, y, width=width_mm * mm, height=height_mm * mm,
+                          preserveAspectRatio=True, anchor="c", mask="auto")
+        self.y = y - 4 * mm
+
+    def logo(self, path, max_w_mm=28, max_h_mm=20):
+        """
+        لوگو را در گوشه بالا-چپ صفحه جاری رسم می‌کند (موقعیت مطلق، مستقل از جریان متن —
+        فقط روی صفحه اول/جلد فراخوانی می‌شود، پس نیازی به جابه‌جایی self.y نیست).
+        """
+        from app.core.image_utils import fit_dimensions
+        w_mm, h_mm = fit_dimensions(path, max_w_mm, max_h_mm)
+        x = self.margin
+        y = self.page_h - self.margin - h_mm * mm
+        self.c.drawImage(path, x, y, width=w_mm * mm, height=h_mm * mm, preserveAspectRatio=True, mask="auto")
+
+    def spacer(self, mm_amount=4):
+        self.y -= mm_amount * mm
+
+    def save(self):
+        self._draw_footer()
+        self.c.save()
+        for f in self._tmp_files:
+            try:
+                pathlib.Path(f).unlink()
+            except OSError:
+                pass
+
+
+def _fmt_num(x):
+    try:
+        return f"{x:,.0f}"
+    except Exception:
+        return str(x)
+
+
+def _level_fa(level: str) -> str:
+    return {"Low concentration": "تمرکز پایین", "Medium concentration": "تمرکز متوسط",
+            "High concentration": "تمرکز بالا"}.get(level, level)
+
+
+def _symbol_label(conn) -> str:
+    rows = conn.execute("SELECT symbol_code, symbol_name FROM symbols").fetchall()
+    if len(rows) == 1:
+        code, name = rows[0]
+        name_clean = clean_display(name) if name and str(name) != "nan" else ""
+        return f"{code} ({name_clean})" if name_clean else str(code)
+    return f"{len(rows)} نماد"
+
+
+def _now_jalali_str() -> str:
+    now = dt.datetime.now()
+    jy, jm, jd = gregorian_to_jalali(now.year, now.month, now.day)
+    return f"{jy:04d}/{jm:02d}/{jd:02d} {now.strftime('%H:%M')}"
+
+
+def generate_pdf_report(conn: sqlite3.Connection, out_path: str, start=None, end=None, top_n=10) -> str:
+    r = RTLReport(out_path)
+    tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="smarteq_charts_"))
+
+    ov = m.overview(conn, start, end)
+    period_start_fa = jalali_date_display(start) if start else jalali_date_display(ov["first_date"])
+    period_end_fa = jalali_date_display(end) if end else jalali_date_display(ov["last_date"])
+
+    # ---------- Cover ----------
+    logo_path = get_logo_path()
+    if logo_path:
+        r.logo(str(logo_path))
+    r.title(get_report_title())
+    company_name = get_company_name()
+    if company_name:
+        r.paragraph(f"شرکت: {company_name}")
+    r.paragraph(f"نماد: {_symbol_label(conn)}")
+    r.paragraph(f"بازه گزارش: از {period_start_fa} تا {period_end_fa}")
+    r.paragraph(f"تهیه‌کننده: {get_report_prepared_by()}   —   ارائه به: {get_report_audience()}")
+    r.paragraph(f"تاریخ تهیه گزارش: {_now_jalali_str()}")
+    r.spacer(3)
+    r.wrapped_paragraph(DEVELOPER_CREDIT_LINE, size=8, color=COLOR_MUTED)
+    r.spacer(6)
+
+    # ---------- 1. Executive summary (narrative) ----------
+    r.heading("۱. خلاصه مدیریتی")
+    for line in ins.executive_summary_narrative(conn, start, end):
+        r.wrapped_paragraph(line, bullet=True)
+    r.spacer(3)
+    r.kv_row("تعداد معاملات", _fmt_num(ov["n_transactions"]))
+    r.kv_row("ارزش کل معاملات (ریال)", _fmt_num(ov["total_value"]))
+    r.kv_row("حجم کل", _fmt_num(ov["total_quantity"]))
+    r.kv_row("میانگین وزنی قیمت", f"{ov['weighted_avg_price']:.1f}")
+    r.kv_row("تعداد خریداران/فروشندگان منحصربه‌فرد", f"{ov['n_unique_buyers']} / {ov['n_unique_sellers']}")
+    r.spacer(4)
+
+    # ---------- 2. Price trend chart ----------
+    r.heading("۲. روند قیمت")
+    series_data = m.price_series(conn, start, end)
+    if len(series_data) >= 2:
+        chart_path = str(tmp_dir / "price.png")
+        ch.price_trend_chart(series_data, chart_path)
+        r._tmp_files.append(chart_path)
+        r.image(chart_path)
+    else:
+        r.paragraph("داده کافی برای رسم نمودار قیمت در این بازه وجود ندارد.")
+    r.spacer(4)
+
+    # ---------- 3. Period comparison ----------
+    r.heading("۳. مقایسه با بازه قبل")
+    cmp_res = comp.auto_compare_with_previous(conn, start, end, top_n=top_n)
+    r.wrapped_paragraph(
+        f"بازه مقایسه: از {cmp_res['period_a']['start_fa']} تا {cmp_res['period_a']['end_fa']} "
+        f"(بازه قبل) در برابر از {cmp_res['period_b']['start_fa']} تا {cmp_res['period_b']['end_fa']} (بازه فعلی)."
+    )
+    for line in cmp_res["narrative"]:
+        r.wrapped_paragraph(line, bullet=True)
+    if cmp_res.get("deltas"):
+        chart_path2 = str(tmp_dir / "cmp.png")
+        ch.comparison_bar_chart(cmp_res["deltas"], chart_path2)
+        r._tmp_files.append(chart_path2)
+        r.image(chart_path2, height_mm=55)
+    r.spacer(4)
+
+    # ---------- 4. Market maker behavior ----------
+    r.heading("۴. رفتار بازارگردان")
+    mm_summary = mm_mod.market_maker_summary(conn, start, end)
+    if mm_summary.get("has_market_maker"):
+        for line in mm_summary["narrative"]:
+            r.wrapped_paragraph(line, bullet=True)
+        chart_path3 = str(tmp_dir / "mm.png")
+        ch.market_maker_chart(mm_summary["daily"], chart_path3)
+        r._tmp_files.append(chart_path3)
+        r.image(chart_path3, height_mm=62)
+    else:
+        r.paragraph("بازارگردانی برای این نماد در این بازه شناسایی نشد.")
+    r.spacer(4)
+
+    # ---------- 5. Top buyer/seller brokers ----------
+    r.heading("۵. کارگزاران برتر خریدار")
+    buyers_b = m.top_brokers(conn, "buyer", start, end, top_n=top_n)
+    total_buy_val = sum(b["value"] for b in m.top_brokers(conn, "buyer", start, end, top_n=100000)) or ov["total_value"]
+    if buyers_b:
+        top_share = buyers_b[0]["value"] / total_buy_val * 100 if total_buy_val else 0
+        r.wrapped_paragraph(f"کارگزار «{buyers_b[0]['broker_name']}» با {top_share:.1f}٪ از ارزش خرید، در رتبه نخست قرار دارد.")
+    r.table(["نام کارگزار", "ارزش (ریال)", "تعداد معاملات"],
+            [[b["broker_name"], _fmt_num(b["value"]), str(b["n_transactions"])] for b in buyers_b],
+            col_widths=[95 * mm, 55 * mm, 30 * mm])
+    r.spacer(4)
+
+    r.heading("۶. کارگزاران برتر فروشنده")
+    sellers_b = m.top_brokers(conn, "seller", start, end, top_n=top_n)
+    r.table(["نام کارگزار", "ارزش (ریال)", "تعداد معاملات"],
+            [[b["broker_name"], _fmt_num(b["value"]), str(b["n_transactions"])] for b in sellers_b],
+            col_widths=[95 * mm, 55 * mm, 30 * mm])
+    r.spacer(4)
+
+    # ---------- 7. Top buyers / sellers (persons) ----------
+    r.heading("۷. خریداران برتر (اشخاص)")
+    top_buy_p = m.top_persons(conn, "buyer", start, end, top_n=top_n)
+    r.table(["نام", "نوع", "ارزش (ریال)"],
+            [[p["name"], p["type"], _fmt_num(p["value"])] for p in top_buy_p],
+            col_widths=[80 * mm, 45 * mm, 55 * mm])
+    r.spacer(4)
+
+    r.heading("۸. فروشندگان برتر (اشخاص)")
+    top_sell_p = m.top_persons(conn, "seller", start, end, top_n=top_n)
+    r.table(["نام", "نوع", "ارزش (ریال)"],
+            [[p["name"], p["type"], _fmt_num(p["value"])] for p in top_sell_p],
+            col_widths=[80 * mm, 45 * mm, 55 * mm])
+    r.spacer(4)
+
+    # ---------- 9. Concentration (HHI) ----------
+    r.heading("۹. تمرکز معاملات (شاخص HHI)")
+    hhi = ext.hhi_summary(conn, start, end)
+    for line in hhi["narrative"]:
+        r.wrapped_paragraph(line, bullet=True)
+    r.spacer(4)
+
+    # ---------- 10. Behavioral patterns ----------
+    r.heading("۱۰. الگوهای رفتاری کوتاه‌مدت")
+    st = bh.top_short_term_traders(conn, start, end, top_n=top_n)
+    r.table(["نام", "امتیاز", "سطح", "تعداد رفت‌وبرگشت"],
+            [[t["name"], f"{t['score']:.0f}", t["level"], str(t["n_round_trips"])] for t in st],
+            col_widths=[65 * mm, 25 * mm, 65 * mm, 25 * mm])
+    r.paragraph("این امتیاز شاخصی آماری از الگوی معاملات مشاهده‌شده است، نه اثبات قصد یا استراتژی واقعی شخص.", size=8)
+    r.spacer(4)
+
+    # ---------- 11. Same-day buy & sell (concrete round-trip evidence) ----------
+    r.heading("۱۱. خرید و فروش هم‌روز (شواهد مستقیم نوسان‌گیری)")
+    r.wrapped_paragraph(bh.DISCLAIMER_SAME_DAY, size=9)
+    r.spacer(2)
+    same_day = bh.same_day_buy_sell_pairs(conn, start, end, top_n=top_n)
+    if same_day:
+        def _fmt_qty_price(qty, price):
+            return f"{qty:,.0f} × {price:,.0f}"
+
+        def _verdict_short(p):
+            tag = "کامل" if p["overlap_ratio"] >= 0.8 else ("محتمل" if p["overlap_ratio"] >= 0.3 else "کم")
+            return f"{tag} ({p['overlap_ratio']:.0%})"
+
+        r.table(["نام", "تاریخ", "خرید (تعداد×نرخ)", "فروش (تعداد×نرخ)", "نوسان‌گیری (هم‌پوشانی)"],
+                [[p["name"], jalali_date_display(p["date"]), _fmt_qty_price(p["buy_qty"], p["buy_price"]),
+                  _fmt_qty_price(p["sell_qty"], p["sell_price"]), _verdict_short(p)] for p in same_day],
+                col_widths=[35 * mm, 22 * mm, 40 * mm, 40 * mm, 37 * mm], size=8.5)
+    else:
+        r.paragraph("در این بازه، شخصی با خرید و فروش همان نماد در یک روز مشخص یافت نشد.")
+    r.spacer(4)
+
+    # ---------- 12. Anomalies ----------
+    r.heading("۱۲. هشدارهای معاملاتی")
+    r.wrapped_paragraph(
+        "«امتیاز ریسک» یک عدد بین ۰ تا ۱۰۰ است که نشان می‌دهد یک معامله یا فعالیت، از نظر آماری چقدر نسبت به "
+        "الگوی معمول همان بازه یا همان روز غیرعادی است — نه اثبات تخلف یا دستکاری. سطوح شدت: قابل‌پایش (۳۰-۵۰)، "
+        "مهم (۵۰-۷۰)، بالا (۷۰-۸۵)، بحرانی (بالای ۸۵). ممکن است چند هشدار «نوع» و «تاریخ» یکسان داشته باشند؛ "
+        "این نشان‌دهنده چند معامله جداگانه و متفاوت در همان روز است، نه تکرار یک مورد — به همین دلیل ارزش و "
+        "توضیح هر مورد جداگانه در زیر آمده است. طرف‌های معامله (در صورت وجود) برای پیگیری و بررسی بیشتر ذکر "
+        "شده‌اند؛ حضور نام در این فهرست به‌معنای اثبات تخلف نیست، صرفاً شناسایی طرف یک الگوی آماری غیرعادی است.",
+        size=9
+    )
+    r.spacer(3)
+    alerts = an.top_alerts_diversified(conn, start, end, top_n=top_n)
+    for i, a in enumerate(alerts, 1):
+        r._check_page_break(4)
+        header = (f"{i}. {alert_type_fa(a['alert_type'])} — شدت: {severity_fa(a['severity'])} "
+                  f"(امتیاز {a['risk_score']:.0f}) — تاریخ: {jalali_date_display(a.get('trade_date', ''))}")
+        if a.get("value"):
+            header += f" — ارزش: {a['value']:,.0f} ریال"
+        r.wrapped_paragraph(header, bold=True, size=9.5)
+        if a.get("buyer_name") or a.get("seller_name"):
+            r.wrapped_paragraph(f"طرف معامله — خریدار: {a.get('buyer_name') or '—'}   |   فروشنده: {a.get('seller_name') or '—'}", size=9)
+        r.wrapped_paragraph(a["reason"], size=9, color=COLOR_MUTED)
+        r.spacer(1.5)
+    r.spacer(3)
+
+    # ---------- 13. Registry / ownership / FIFO ----------
+    r.heading("۱۳. رجیستری، مالکیت و FIFO")
+    fifo = pf.run_fifo(conn)
+    fs = fifo["summary"]
+    for line in [
+        f"افراد تحلیل‌شده: {fs['people']:,} نفر؛ منطبق با رجیستری: {fs['registry_matched']:,} نفر.",
+        f"موارد بالقوه تازه‌وارد: {fs['potential_new_entrants']:,} نفر. این شاخص به‌دلیل احتمال خطای تطبیق هویت، ورود قطعی را اثبات نمی‌کند.",
+        f"تطبیق کامل پایان دوره: {fs['reconciled']:,} نفر؛ دارای اختلاف: {fs['mismatched']:,} نفر.",
+        f"سود تحقق‌یافته با بهای معلوم: {fs['known_realized_pnl']:,.0f} ریال.",
+        f"فروش از موجودی با بهای نامعلوم: {fs['unknown_cost_sold_qty']:,} سهم؛ این بخش عمداً سود/زیان عددی ندارد.",
+        f"فروش حل‌نشده به‌دلیل کمبود موجودی قابل‌تطبیق: {fs['unresolved_sell_qty']:,} سهم.",
+    ]:
+        r.wrapped_paragraph(line, bullet=True, size=9)
+    r.spacer(2)
+    fifo_rows=sorted(fifo["results"],key=lambda x:abs(x["known_realized_pnl"]),reverse=True)[:top_n]
+    r.table(["نام","اول دوره","خرید","فروش","پایان مورد انتظار","پایان رجیستری","اختلاف","سود معلوم"],
+            [[x["name"] or "—",_fmt_num(x["opening_qty"]),_fmt_num(x["daily_buy_qty"]),_fmt_num(x["daily_sell_qty"]),
+              _fmt_num(x["expected_closing_qty"]),
+              _fmt_num(x["registry_closing_qty"]) if x["registry_closing_qty"] is not None else "—",
+              _fmt_num(x["reconciliation_diff"]) if x["reconciliation_diff"] is not None else "—",
+              _fmt_num(x["known_realized_pnl"])]
+             for x in fifo_rows],
+            col_widths=[40*mm,21*mm,21*mm,21*mm,25*mm,25*mm,22*mm,25*mm], size=7.5)
+    r.wrapped_paragraph(
+        "قاعده FIFO: موجودی اول دوره از رجیستری به‌عنوان Lot با بهای تمام‌شده نامعلوم، و خریدهای روزانه با بهای خرید معلوم ثبت شده‌اند. "
+        "بنابراین سود تحقق‌یافته فقط برای لات‌های دارای بهای معلوم گزارش می‌شود.",
+        size=8, color=COLOR_MUTED
+    )
+    r.spacer(4)
+
+    # ---------- 13. Fundamental analysis (honest limitation) ----------
+    r.heading("۱۴. تحلیل بنیادی")
+    fund = ext.fundamental_analysis_note(conn)
+    for line in fund["narrative"]:
+        r.wrapped_paragraph(line, bullet=True)
+    r.spacer(2)
+    r.sub_heading("داده‌های مالی لازم برای تکمیل این بخش:")
+    for line in fund["required_data"]:
+        r.wrapped_paragraph(line, bullet=True, size=9)
+    r.spacer(4)
+
+    # ---------- 14. Qualitative analysis ----------
+    r.heading("۱۵. تحلیل کیفی (رفتار بازار)")
+    qual = ext.qualitative_market_behavior(conn, start, end)
+    for line in qual["narrative"]:
+        r.wrapped_paragraph(line, bullet=True)
+    r.kv_row("سهم خرید حقوقی", f"{qual['institutional_share_pct']:.1f}٪")
+    r.kv_row("سهم خرید حقیقی", f"{qual['individual_share_pct']:.1f}٪")
+    r.spacer(4)
+
+    # ---------- 15. Valuation methods ----------
+    r.heading("۱۶. روش‌های ارزش‌گذاری")
+    val = ext.valuation_methods_overview(conn, start, end)
+    r.table(["روش", "داده مورد نیاز"],
+            [[me["name"], me["needs"]] for me in val["methods"]],
+            col_widths=[60 * mm, 114 * mm], size=9)
+    r.spacer(2)
+    for line in val["narrative"]:
+        r.wrapped_paragraph(line, bullet=True, size=9)
+    r.spacer(4)
+
+    # ---------- 16. Methodology ----------
+    r.heading("۱۷. روش‌شناسی")
+    for line in [
+        "میانگین وزنی قیمت: مجموع (تعداد × قیمت) تقسیم بر مجموع تعداد، نه میانگین ساده قیمت‌ها.",
+        "شاخص تمرکز HHI: مجموع مجذور سهم هر شخص از ارزش خرید (مقیاس ۰ تا ۱۰,۰۰۰).",
+        "تشخیص ناهنجاری: بر پایه Z-score و IQR نسبت به میانگین/میانه همان بازه یا همان روز.",
+        "امتیاز رفتار کوتاه‌مدت: ترکیب وزنی تعداد رفت‌وبرگشت خرید-فروش، تعداد روزهای فعال، و نسبت گردش.",
+        "خرید و فروش هم‌روز: بر مبنای اختلاف میانگین نرخ خرید/فروش همان روز، نه تطبیق دقیق لات (FIFO/LIFO واقعی نامعلوم است).",
+        "مقایسه با بازه قبل: به‌طور پیش‌فرض با بازه‌ای هم‌طول و بلافاصله قبل از بازه انتخابی مقایسه می‌شود.",
+        "تحلیل بازارگردان: هم‌زمانی آماری بین خرید/فروش خالص بازارگردان و جهت تغییر قیمت روزانه را می‌سنجد؛ رابطه علّی را اثبات نمی‌کند.",
+    ]:
+        r.wrapped_paragraph(line, size=9, bullet=True)
+    r.spacer(3)
+
+    # ---------- 17. Data limitations ----------
+    r.heading("۱۸. محدودیت‌های داده")
+    for line in [
+        "تشخیص رفتار کوتاه‌مدت بر مبنای روز معاملاتی است، نه ساعت دقیق سفارش.",
+        "هویت اشخاص بدون کد ملی صرفاً بر اساس نام (با اطمینان پایین) شناسایی شده است.",
+        "این گزارش شاخص‌های آماری ارائه می‌دهد و جایگزین بررسی رگولاتوری یا حقوقی نیست.",
+        "همبستگی آماری میان فعالیت بازارگردان و تغییر قیمت، به‌معنای رابطه علّی نیست.",
+        "تحلیل بنیادی و روش‌های ارزش‌گذاری واقعی نیازمند صورت‌های مالی شرکت‌اند که در این دیتاست معاملاتی موجود نیست.",
+    ]:
+        r.wrapped_paragraph(line, size=9, bullet=True)
+
+    r.save()
+    try:
+        tmp_dir.rmdir()
+    except OSError:
+        pass
+    return out_path
+
+
+if __name__ == "__main__":
+    db_path = str(pathlib.Path(__file__).resolve().parents[2] / "data" / "smart_equity.db")
+    conn = sqlite3.connect(db_path)
+    out = generate_pdf_report(conn, str(pathlib.Path(__file__).resolve().parents[2] / "exports" / "gozaresh_hiat_modire.pdf"))
+    print("Saved:", out)

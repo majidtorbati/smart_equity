@@ -1,0 +1,33 @@
+"""ترجمه برچسب‌های داخلی (انگلیسی) به فارسی برای نمایش یکدست در GUI و گزارش‌ها."""
+
+ALERT_TYPE_FA = {
+    "Large Trade": "معامله حجیم/بزرگ",
+    "Price Outlier": "قیمت غیرعادی",
+    "Broker Activity Spike": "جهش فعالیت کارگزار",
+}
+
+SEVERITY_FA = {
+    "Normal": "عادی",
+    "Watch": "قابل پایش",
+    "Important": "مهم",
+    "High": "بالا",
+    "Critical": "بحرانی",
+}
+
+CONCENTRATION_LEVEL_FA = {
+    "Low concentration": "تمرکز پایین",
+    "Medium concentration": "تمرکز متوسط",
+    "High concentration": "تمرکز بالا",
+}
+
+
+def alert_type_fa(value: str) -> str:
+    return ALERT_TYPE_FA.get(value, value)
+
+
+def severity_fa(value: str) -> str:
+    return SEVERITY_FA.get(value, value)
+
+
+def concentration_level_fa(value: str) -> str:
+    return CONCENTRATION_LEVEL_FA.get(value, value)
