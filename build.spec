@@ -21,6 +21,8 @@ a = Analysis(
     datas=numpy_datas + [
         ('assets/Vazirmatn-Regular.ttf', 'assets'),
         ('assets/Vazirmatn-Bold.ttf', 'assets'),
+        ('assets/BNazanin.ttf', 'assets'),
+        ('assets/BTitrBd.ttf', 'assets'),
         ('app/data/schema.sql', 'app/data'),
         ('config/settings.json', 'config'),
     ],
