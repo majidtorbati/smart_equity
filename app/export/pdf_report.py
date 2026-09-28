@@ -72,6 +72,7 @@ class RTLReport:
         visual = fa(text)
 
         font_name = "VazirmatnBold" if primary_font == "BTitr" else "Vazirmatn"
+        pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/%+\-()]*")
 
         return [(visual, font_name)]
 
